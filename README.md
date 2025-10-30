@@ -20,11 +20,19 @@ The CNN Dataset Annotation Tool is a desktop application built with PySide that 
 6. **Review and revert if needed** using the preserved originals to undo accidental edits.
 7. **Export the edited labels** to generate a clean set of masks ready for downstream training or evaluation workflows.
 
-## Project Goals
-This README provides the high-level scope so that future iterations can focus on:
-- Implementing the PySide user interface and view components.
-- Wiring dataset import logic and class/color configuration panels.
-- Delivering performant brush-based painting with real-time overlays.
-- Finalizing export pipelines that keep both original and edited labels organized.
+## Getting Started
+1. Create and activate a Python 3.10+ virtual environment.
+2. Install dependencies with `pip install -r requirements.txt`.
+3. Run the tool with `python main.py`.
+
+The included `datasets/images` and `datasets/labels` folders contain a tiny sample pair you can use for a smoke test.
+
+## Current Implementation Highlights
+- Load image and label folders independently; matching filenames are paired automatically.
+- Auto-detect classes from loaded label masks, with controls to rename, reassign values, and choose display colors.
+- Adjustable overlay alpha for inspecting the segmentation mask on top of the source image.
+- Circular brush with configurable size and live preview for repainting pixels from a chosen source class to a target class.
+- Zoom with the mouse wheel (hold `Ctrl`), pan with the middle mouse button, and revert label edits at any time.
+- Export edited masks to a user-selected directory without modifying the originals.
 
 Contributions and feedback are welcome as the tool evolves from this specification into a full annotation workflow.
