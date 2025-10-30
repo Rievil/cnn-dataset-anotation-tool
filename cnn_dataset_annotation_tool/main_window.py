@@ -35,7 +35,7 @@ from .io_utils import (
     save_entries_to_parquet,
     save_label_image,
 )
-from .label_canvas import LabelCanvas
+from .label_canvas import LabelCanvas, ToolMode
 from .models import ClassDefinition, DatasetEntry
 
 
@@ -125,8 +125,9 @@ class MainWindow(QMainWindow):
 
         # Brush info
         brush_hint = QLabel(
-            "Brush shape: circle. Hold Ctrl + mouse wheel to zoom, middle mouse to pan.\n"
-            "Left click: source → target, right click: target → source."
+            "Brush: circular stroke. Hold Ctrl + mouse wheel to zoom, middle mouse to pan.\n"
+            "Brush left click: source → target, right click: target → source.\n"
+            "Lasso: hold left to trace an area, release to fill. Right click cancels. Magnetic lasso snaps to edges."
         )
         brush_hint.setWordWrap(True)
         control_layout.addWidget(brush_hint, 2, 0, 1, 3)
@@ -138,6 +139,14 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.source_combo, 3, 1, 1, 2)
         control_layout.addWidget(QLabel("Target Class"), 4, 0)
         control_layout.addWidget(self.target_combo, 4, 1, 1, 2)
+
+        # Tool selection
+        self.tool_combo = QComboBox()
+        self.tool_combo.addItem("Brush", ToolMode.BRUSH)
+        self.tool_combo.addItem("Freehand Lasso", ToolMode.LASSO)
+        self.tool_combo.addItem("Magnetic Lasso", ToolMode.MAGNETIC_LASSO)
+        control_layout.addWidget(QLabel("Editing Tool"), 5, 0)
+        control_layout.addWidget(self.tool_combo, 5, 1, 1, 2)
 
         right_layout.addWidget(control_panel)
 
@@ -162,11 +171,13 @@ class MainWindow(QMainWindow):
         self.brush_spin.valueChanged.connect(self._handle_brush_spin_changed)
         self.source_combo.currentIndexChanged.connect(self._update_paint_values)
         self.target_combo.currentIndexChanged.connect(self._update_paint_values)
+        self.tool_combo.currentIndexChanged.connect(self._handle_tool_changed)
         self.canvas.labelEdited.connect(self._handle_label_edited)
         self.class_manager.classesChanged.connect(self._handle_classes_changed)
         self.class_manager.autoPopulateRequested.connect(self._auto_populate_classes)
 
         self._update_paint_values()
+        self._handle_tool_changed(self.tool_combo.currentIndex())
 
     # ----- Dataset handling -------------------------------------------------
     def load_dataset(self) -> None:
@@ -336,6 +347,17 @@ class MainWindow(QMainWindow):
             self.brush_slider.setValue(value)
         self.canvas.set_brush_radius(value)
 
+    def _handle_tool_changed(self, index: int) -> None:
+        data = self.tool_combo.itemData(index)
+        mode = data if isinstance(data, ToolMode) else ToolMode.BRUSH
+        self.canvas.set_tool_mode(mode)
+        self._update_tool_controls(mode)
+
+    def _update_tool_controls(self, mode: ToolMode) -> None:
+        is_brush = mode == ToolMode.BRUSH
+        self.brush_slider.setEnabled(is_brush)
+        self.brush_spin.setEnabled(is_brush)
+
     def _handle_classes_changed(self) -> None:
         if not self._suppress_class_dirty:
             self._session_dirty = True
@@ -435,6 +457,7 @@ class MainWindow(QMainWindow):
             self.canvas.clear()
             return
         entry = self.entries[self.current_index]
+        self.canvas.set_base_image(entry.image)
         self.canvas.set_label_array(entry.edited_label)
         classes = self.class_manager.get_classes()
         pixmap = self._render_overlay(
