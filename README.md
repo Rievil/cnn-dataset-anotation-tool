@@ -1,1 +1,30 @@
-# cnn-dataset-anotation-tool
+# CNN Dataset Annotation Tool
+
+## Overview
+The CNN Dataset Annotation Tool is a desktop application built with PySide that streamlines the review and correction of pixel-wise labels for convolutional neural network (CNN) datasets. The tool loads paired images and label masks, lets you visualize segmentation results with customizable overlays, and offers intuitive editing utilities to repair mislabeled pixels before exporting an updated label set.
+
+## Key Features
+- **Dataset Loader** – Select separate folders for source images and their corresponding label masks. The tool handles dataset initialization and maintains the link between each image-label pair.
+- **Class Management** – Define the semantic classes present in the dataset, assign the integer pixel value each class represents (for example `0 = background`, `1 = matrix`, `2 = crack`, `3 = pore`), and configure per-class display colors.
+- **Label Visualization** – Display images with an adjustable overlay of their labels using a Jet colormap. Control the alpha value to fine-tune the transparency of the mask and make label discrepancies easy to spot.
+- **Interactive Editing** – Pick a source class (e.g., `pore`) and a target class (e.g., `matrix`) to repaint false positives. Editing is applied with a brush whose size and shape are visualized in real time, ensuring precise corrections.
+- **Navigation Tools** – Zoom in/out to inspect details, reposition the cursor accurately, and pan across the canvas by holding the middle mouse button.
+- **Revision Control** – Every label mask is duplicated before edits begin so that you can revert to the original state at any time. When edits are complete, export the modified masks as a new label set without overwriting the originals.
+
+## Typical Workflow
+1. **Launch the application** and choose the directories that contain your images and the associated labels.
+2. **Configure class mappings** by entering each class name, its pixel value, and the desired display color.
+3. **Tune the visualization** by adjusting the overlay alpha until the areas needing attention stand out.
+4. **Select a repaint operation** by picking the source class you want to correct and the target class you want those pixels to become.
+5. **Use the brush tool** to apply corrections, leveraging zoom and pan to work on fine details. The on-screen brush preview helps confirm the brush footprint before committing changes.
+6. **Review and revert if needed** using the preserved originals to undo accidental edits.
+7. **Export the edited labels** to generate a clean set of masks ready for downstream training or evaluation workflows.
+
+## Project Goals
+This README provides the high-level scope so that future iterations can focus on:
+- Implementing the PySide user interface and view components.
+- Wiring dataset import logic and class/color configuration panels.
+- Delivering performant brush-based painting with real-time overlays.
+- Finalizing export pipelines that keep both original and edited labels organized.
+
+Contributions and feedback are welcome as the tool evolves from this specification into a full annotation workflow.
