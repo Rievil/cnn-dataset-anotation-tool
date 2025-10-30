@@ -51,6 +51,7 @@ class MainWindow(QMainWindow):
         self._session_dirty = False
         self._session_path: Optional[Path] = None
         self._suppress_class_dirty = False
+        self._controls_last_size = 320
         self._build_ui()
 
     # ----- UI construction --------------------------------------------------
@@ -73,10 +74,14 @@ class MainWindow(QMainWindow):
         dataset_row.addStretch(1)
         self.dataset_status = QLabel("No dataset loaded")
         dataset_row.addWidget(self.dataset_status)
+        self.controls_toggle_button = QPushButton("Hide Controls")
+        self.controls_toggle_button.setCheckable(True)
+        self.controls_toggle_button.setChecked(False)
+        dataset_row.addWidget(self.controls_toggle_button)
         root_layout.addLayout(dataset_row)
 
-        splitter = QSplitter(Qt.Horizontal)
-        root_layout.addWidget(splitter, 1)
+        self.splitter = QSplitter(Qt.Horizontal)
+        root_layout.addWidget(self.splitter, 1)
 
         # Image list panel
         left_panel = QWidget()
@@ -86,16 +91,24 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(QLabel("<b>Image Pairs</b>"))
         self.image_list = QListWidget()
         left_layout.addWidget(self.image_list, 1)
-        splitter.addWidget(left_panel)
+        self.splitter.addWidget(left_panel)
 
-        # Viewer + controls
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(10)
+        # Canvas area
+        canvas_panel = QWidget()
+        canvas_layout = QVBoxLayout(canvas_panel)
+        canvas_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_layout.setSpacing(0)
 
         self.canvas = LabelCanvas()
-        right_layout.addWidget(self.canvas, 1)
+        canvas_layout.addWidget(self.canvas, 1)
+
+        self.splitter.addWidget(canvas_panel)
+
+        # Controls panel on the right
+        self.controls_container = QWidget()
+        controls_outer_layout = QVBoxLayout(self.controls_container)
+        controls_outer_layout.setContentsMargins(0, 0, 0, 0)
+        controls_outer_layout.setSpacing(10)
 
         control_panel = QGroupBox("Controls")
         control_layout = QGridLayout(control_panel)
@@ -148,15 +161,17 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(QLabel("Editing Tool"), 5, 0)
         control_layout.addWidget(self.tool_combo, 5, 1, 1, 2)
 
-        right_layout.addWidget(control_panel)
+        controls_outer_layout.addWidget(control_panel)
 
         # Class manager block
         self.class_manager = ClassManagerWidget()
-        right_layout.addWidget(self.class_manager)
+        controls_outer_layout.addWidget(self.class_manager)
 
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
+        self.splitter.addWidget(self.controls_container)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 0)
+        self.splitter.setSizes([260, 700, self._controls_last_size])
 
         self.setCentralWidget(central)
 
@@ -175,9 +190,12 @@ class MainWindow(QMainWindow):
         self.canvas.labelEdited.connect(self._handle_label_edited)
         self.class_manager.classesChanged.connect(self._handle_classes_changed)
         self.class_manager.autoPopulateRequested.connect(self._auto_populate_classes)
+        self.controls_toggle_button.toggled.connect(self._handle_controls_toggled)
 
         self._update_paint_values()
         self._handle_tool_changed(self.tool_combo.currentIndex())
+        self._set_controls_visible(True)
+        self._update_controls_toggle_text(True)
 
     # ----- Dataset handling -------------------------------------------------
     def load_dataset(self) -> None:
@@ -357,6 +375,44 @@ class MainWindow(QMainWindow):
         is_brush = mode == ToolMode.BRUSH
         self.brush_slider.setEnabled(is_brush)
         self.brush_spin.setEnabled(is_brush)
+
+    def _handle_controls_toggled(self, checked: bool) -> None:
+        visible = not checked
+        self._set_controls_visible(visible, from_toggle=True)
+
+    def _set_controls_visible(self, visible: bool, *, from_toggle: bool = False) -> None:
+        if visible:
+            self.controls_container.show()
+            sizes = self.splitter.sizes()
+            if len(sizes) < 3:
+                sizes = list(sizes) + [self._controls_last_size]
+            sizes = list(sizes[:3])
+            if len(sizes) < 3:
+                sizes.extend([300] * (3 - len(sizes)))
+            if sizes[0] <= 0:
+                sizes[0] = 260
+            if sizes[1] <= 0:
+                sizes[1] = max(self.splitter.width() - sizes[0] - self._controls_last_size, 400)
+            self._controls_last_size = max(self._controls_last_size, 200)
+            sizes[2] = self._controls_last_size
+            self.splitter.setSizes(sizes)
+        else:
+            sizes = self.splitter.sizes()
+            if len(sizes) >= 3 and sizes[2] > 0:
+                self._controls_last_size = sizes[2]
+            if len(sizes) >= 3:
+                sizes = list(sizes)
+                sizes[2] = 0
+                self.splitter.setSizes(sizes)
+            self.controls_container.hide()
+        if not from_toggle:
+            self.controls_toggle_button.blockSignals(True)
+            self.controls_toggle_button.setChecked(not visible)
+            self.controls_toggle_button.blockSignals(False)
+        self._update_controls_toggle_text(visible)
+
+    def _update_controls_toggle_text(self, visible: bool) -> None:
+        self.controls_toggle_button.setText("Hide Controls" if visible else "Show Controls")
 
     def _handle_classes_changed(self) -> None:
         if not self._suppress_class_dirty:
