@@ -783,13 +783,18 @@ class MainWindow(QMainWindow):
         if image_rgb.ndim == 2:
             image_rgb = np.stack([image_rgb] * 3, axis=-1)
         color_map: Dict[int, Tuple[int, int, int]] = {cls.value: cls.color_tuple() for cls in classes}
-        label_values = labels.astype(np.int32, copy=False)
-        color_overlay = np.zeros((*label_values.shape, 3), dtype=np.float32)
+        label_values = np.asarray(labels, dtype=np.int32)
         unique_values = np.unique(label_values)
-        for value in unique_values:
-            color = color_map.get(int(value), fallback_color(int(value)))
-            mask = label_values == value
-            color_overlay[mask] = color
+        if unique_values.size == 0:
+            color_overlay = np.zeros((*label_values.shape, 3), dtype=np.float32)
+        else:
+            colors = np.array(
+                [color_map.get(int(value), fallback_color(int(value))) for value in unique_values],
+                dtype=np.float32,
+            )
+            indices = unique_values.searchsorted(label_values)
+            color_overlay = colors[indices]
+
         blend_alpha = np.clip(alpha, 0.0, 1.0)
         blended = image_rgb * (1.0 - blend_alpha) + color_overlay * blend_alpha
         blended = np.clip(blended, 0, 255).astype(np.uint8)
