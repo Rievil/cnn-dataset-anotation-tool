@@ -1,3 +1,5 @@
 """Core package for the CNN dataset annotation tool."""
 
-__all__ = ["main_window"]
+from .dataset_store import DatasetStore
+
+__all__ = ["DatasetStore", "main_window"]

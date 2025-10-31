@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -19,9 +20,13 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QSlider,
     QSpinBox,
     QSplitter,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
     QComboBox,
@@ -52,6 +57,7 @@ class MainWindow(QMainWindow):
         self._session_path: Optional[Path] = None
         self._suppress_class_dirty = False
         self._controls_last_size = 320
+        self._show_original_label = False
         self._build_ui()
 
     # ----- UI construction --------------------------------------------------
@@ -108,7 +114,16 @@ class MainWindow(QMainWindow):
         self.controls_container = QWidget()
         controls_outer_layout = QVBoxLayout(self.controls_container)
         controls_outer_layout.setContentsMargins(0, 0, 0, 0)
-        controls_outer_layout.setSpacing(10)
+        controls_outer_layout.setSpacing(0)
+
+        self.controls_tabs = QTabWidget()
+        controls_outer_layout.addWidget(self.controls_tabs)
+
+        # Tab 1: editing tools
+        tools_tab = QWidget()
+        tools_layout = QVBoxLayout(tools_tab)
+        tools_layout.setContentsMargins(0, 0, 0, 0)
+        tools_layout.setSpacing(10)
 
         control_panel = QGroupBox("Controls")
         control_layout = QGridLayout(control_panel)
@@ -161,11 +176,59 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(QLabel("Editing Tool"), 5, 0)
         control_layout.addWidget(self.tool_combo, 5, 1, 1, 2)
 
-        controls_outer_layout.addWidget(control_panel)
+        tools_layout.addWidget(control_panel)
 
         # Class manager block
         self.class_manager = ClassManagerWidget()
-        controls_outer_layout.addWidget(self.class_manager)
+        tools_layout.addWidget(self.class_manager, 1)
+
+        self.controls_tabs.addTab(tools_tab, "Tools")
+
+        # Tab 2: label view switching
+        label_view_tab = QWidget()
+        label_view_layout = QVBoxLayout(label_view_tab)
+        label_view_layout.setContentsMargins(12, 12, 12, 12)
+        label_view_layout.setSpacing(12)
+
+        self.edited_radio = QRadioButton("Show edited label (current working copy)")
+        self.original_radio = QRadioButton("Show original label (read-only preview)")
+        self.edited_radio.setChecked(True)
+
+        self.label_view_status = QLabel()
+        self.label_view_status.setWordWrap(True)
+
+        label_view_layout.addWidget(self.edited_radio)
+        label_view_layout.addWidget(self.original_radio)
+        label_view_layout.addWidget(self.label_view_status)
+        label_view_layout.addStretch(1)
+
+        self.controls_tabs.addTab(label_view_tab, "Label View")
+
+        # Tab 3: dataset description table
+        description_tab = QWidget()
+        description_layout = QVBoxLayout(description_tab)
+        description_layout.setContentsMargins(8, 8, 8, 8)
+        description_layout.setSpacing(8)
+
+        description_layout.addWidget(QLabel("Dataset description key/value pairs:"))
+        self.description_table = QTableWidget(0, 2)
+        self.description_table.setHorizontalHeaderLabels(["Key", "Value"])
+        self.description_table.horizontalHeader().setStretchLastSection(True)
+        self.description_table.verticalHeader().setVisible(False)
+        self.description_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.description_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.description_table.setEditTriggers(QTableWidget.AllEditTriggers)
+        description_layout.addWidget(self.description_table, 1)
+
+        description_buttons = QHBoxLayout()
+        description_buttons.addStretch(1)
+        self.add_description_row_button = QPushButton("Add Row")
+        self.remove_description_row_button = QPushButton("Remove Selected")
+        description_buttons.addWidget(self.add_description_row_button)
+        description_buttons.addWidget(self.remove_description_row_button)
+        description_layout.addLayout(description_buttons)
+
+        self.controls_tabs.addTab(description_tab, "Description")
 
         self.splitter.addWidget(self.controls_container)
         self.splitter.setStretchFactor(0, 0)
@@ -190,12 +253,17 @@ class MainWindow(QMainWindow):
         self.canvas.labelEdited.connect(self._handle_label_edited)
         self.class_manager.classesChanged.connect(self._handle_classes_changed)
         self.class_manager.autoPopulateRequested.connect(self._auto_populate_classes)
+        self.edited_radio.toggled.connect(self._handle_label_view_toggled)
+        self.original_radio.toggled.connect(self._handle_label_view_toggled)
+        self.add_description_row_button.clicked.connect(self._add_description_row)
+        self.remove_description_row_button.clicked.connect(self._remove_description_row)
         self.controls_toggle_button.toggled.connect(self._handle_controls_toggled)
 
         self._update_paint_values()
         self._handle_tool_changed(self.tool_combo.currentIndex())
         self._set_controls_visible(True)
         self._update_controls_toggle_text(True)
+        self._update_label_view_status()
 
     # ----- Dataset handling -------------------------------------------------
     def load_dataset(self) -> None:
@@ -274,6 +342,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         self.entries = entries
         self.image_list.clear()
+        self.description_table.setRowCount(0)
         for entry in entries:
             item = QListWidgetItem(entry.name)
             self.image_list.addItem(item)
@@ -376,6 +445,24 @@ class MainWindow(QMainWindow):
         self.brush_slider.setEnabled(is_brush)
         self.brush_spin.setEnabled(is_brush)
 
+    def _handle_label_view_toggled(self) -> None:
+        show_original = self.original_radio.isChecked()
+        if show_original == self._show_original_label:
+            return
+        self._show_original_label = show_original
+        self._update_label_view_status()
+        self._refresh_canvas()
+
+    def _update_label_view_status(self) -> None:
+        if self._show_original_label:
+            text = (
+                "Viewing original labels. Editing tools still modify the edited copy; "
+                "switch back to review your changes."
+            )
+        else:
+            text = "Viewing edited labels (default working copy)."
+        self.label_view_status.setText(text)
+
     def _handle_controls_toggled(self, checked: bool) -> None:
         visible = not checked
         self._set_controls_visible(visible, from_toggle=True)
@@ -413,6 +500,37 @@ class MainWindow(QMainWindow):
 
     def _update_controls_toggle_text(self, visible: bool) -> None:
         self.controls_toggle_button.setText("Hide Controls" if visible else "Show Controls")
+
+    def _add_description_row(self) -> None:
+        row = self.description_table.rowCount()
+        self.description_table.insertRow(row)
+        self.description_table.setItem(row, 0, QTableWidgetItem(""))
+        self.description_table.setItem(row, 1, QTableWidgetItem(""))
+        self.description_table.editItem(self.description_table.item(row, 0))
+
+    def _remove_description_row(self) -> None:
+        selection = self.description_table.selectionModel()
+        if selection is None:
+            return
+        rows = sorted({index.row() for index in selection.selectedRows()}, reverse=True)
+        if not rows:
+            if self.description_table.rowCount() > 0:
+                self.description_table.removeRow(self.description_table.rowCount() - 1)
+            return
+        for row in rows:
+            self.description_table.removeRow(row)
+
+    def _collect_description_entries(self) -> Dict[str, str]:
+        entries: Dict[str, str] = {}
+        for row in range(self.description_table.rowCount()):
+            key_item = self.description_table.item(row, 0)
+            value_item = self.description_table.item(row, 1)
+            key = key_item.text().strip() if key_item else ""
+            if not key:
+                continue
+            value = value_item.text().strip() if value_item else ""
+            entries[key] = value
+        return entries
 
     def _handle_classes_changed(self) -> None:
         if not self._suppress_class_dirty:
@@ -516,9 +634,10 @@ class MainWindow(QMainWindow):
         self.canvas.set_base_image(entry.image)
         self.canvas.set_label_array(entry.edited_label)
         classes = self.class_manager.get_classes()
+        overlay_labels = entry.original_label if self._show_original_label else entry.edited_label
         pixmap = self._render_overlay(
             entry.image,
-            entry.edited_label,
+            overlay_labels,
             classes,
             self.alpha_slider.value() / 100.0,
         )

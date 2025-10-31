@@ -27,6 +27,41 @@ The CNN Dataset Annotation Tool is a desktop application built with PySide that 
 
 The included `datasets/images` and `datasets/labels` folders contain a tiny sample pair you can use for a smoke test.
 
+## Command Line Dataset Management
+Install the dependencies and run the CLI to work with parquet datasets:
+
+```
+python -m cnn_dataset_annotation_tool.cli --dataset work.parquet list
+```
+
+Available subcommands:
+- `list` – show every entry with its image, label, and metadata.
+- `add NAME IMAGE LABEL [-m KEY=VALUE ...] [--overwrite]` – append a new item (optionally replacing an existing one).
+- `remove NAME` – delete an entry.
+- `update NAME [--image IMAGE] [--label LABEL] [-m KEY=VALUE ...] [--replace-metadata|--clear-metadata]` – modify data or metadata.
+
+Metadata is stored as JSON key-value pairs. Provide `-m key=value` multiple times to set or update fields.
+
+## Programmatic Usage
+Use the `DatasetStore` helper for Python workflows:
+
+```python
+from pathlib import Path
+from cnn_dataset_annotation_tool import DatasetStore
+
+store = DatasetStore.load(Path("work.parquet"))
+store.add_entry(
+    name="sample",
+    image_path=Path("datasets/images/sample.png"),
+    label_path=Path("datasets/labels/sample.png"),
+    metadata={"split": "train", "notes": "new capture"},
+)
+store.save()
+
+for entry in store.list_entries():
+    print(entry.name, entry.metadata)
+```
+
 ## Current Implementation Highlights
 - Load image and label folders independently; matching filenames are paired automatically.
 - Auto-detect classes from loaded label masks, with controls to rename, reassign values, and choose display colors.

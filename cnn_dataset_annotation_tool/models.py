@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 from PySide6.QtGui import QColor
@@ -18,6 +18,7 @@ class DatasetEntry:
     image: np.ndarray  # RGB uint8
     original_label: np.ndarray  # int32
     edited_label: np.ndarray  # int32
+    metadata: Dict[str, str] = field(default_factory=dict)
 
     def reset_edits(self) -> None:
         """Restore edited label to original."""

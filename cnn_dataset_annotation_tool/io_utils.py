@@ -89,6 +89,7 @@ def load_dataset_from_folders(image_dir: Path, label_dir: Path) -> Tuple[List[Da
                 image=image,
                 original_label=label,
                 edited_label=label.copy(),
+                metadata={},
             )
         )
 
@@ -137,6 +138,7 @@ def save_entries_to_parquet(
                 "edited_shape": list(edit_shape),
                 "edited_dtype": edit_dtype,
                 "classes_json": classes_payload,
+                "metadata_json": json.dumps({str(k): str(v) for k, v in (entry.metadata or {}).items()}),
             }
         )
     df = pd.DataFrame.from_records(records)
@@ -176,6 +178,15 @@ def load_entries_from_parquet(path: Path) -> Tuple[List[DatasetEntry], Optional[
             row["edited_shape"],
             row["edited_dtype"],
         ).copy()
+        metadata: Dict[str, str] = {}
+        metadata_raw = row.get("metadata_json") if hasattr(row, "get") else None
+        if isinstance(metadata_raw, (str, bytes)) and metadata_raw:
+            try:
+                decoded = json.loads(metadata_raw)
+                if isinstance(decoded, dict):
+                    metadata = {str(k): str(v) for k, v in decoded.items()}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
         entries.append(
             DatasetEntry(
                 name=str(row["name"]),
@@ -184,6 +195,7 @@ def load_entries_from_parquet(path: Path) -> Tuple[List[DatasetEntry], Optional[
                 image=image,
                 original_label=original,
                 edited_label=edited,
+                metadata=metadata,
             )
         )
     return entries, classes
