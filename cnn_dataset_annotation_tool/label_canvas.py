@@ -13,6 +13,7 @@ class ToolMode(Enum):
     BRUSH = "brush"
     LASSO = "lasso"
     MAGNETIC_LASSO = "magnetic_lasso"
+    POLYGON = "polygon"
 
 
 class LabelCanvas(QGraphicsView):
@@ -138,6 +139,9 @@ class LabelCanvas(QGraphicsView):
                 self._last_paint_point = scene_pos
                 event.accept()
                 return
+        elif self._tool_mode == ToolMode.POLYGON:
+            if self._handle_polygon_press(event):
+                return
         else:
             scene_pos = self.mapToScene(event.position().toPoint())
             if self._lasso_active:
@@ -183,6 +187,61 @@ class LabelCanvas(QGraphicsView):
         else:
             super().mousePressEvent(event)
 
+    def _handle_polygon_press(self, event) -> bool:
+        if event.button() == Qt.MiddleButton:
+            return False
+        scene_pos = self.mapToScene(event.position().toPoint())
+        if event.button() == Qt.LeftButton:
+            if self._label_array is None or self._target_value is None:
+                event.accept()
+                return True
+            if not self._within_image(scene_pos):
+                event.accept()
+                return True
+            if not self._lasso_active:
+                self._begin_lasso(scene_pos)
+                event.accept()
+                return True
+            if self._is_near_lasso_start(scene_pos):
+                self._active_source = self._source_value
+                self._active_target = self._target_value
+                if self._active_target is None:
+                    self._cancel_lasso()
+                    self.viewport().update()
+                    event.accept()
+                    return True
+                changed = self._finish_lasso()
+                if changed:
+                    self.labelEdited.emit()
+                event.accept()
+                return True
+            self._append_lasso_point(scene_pos)
+            self.viewport().update()
+            event.accept()
+            return True
+        if event.button() == Qt.RightButton:
+            if not self._lasso_active:
+                event.accept()
+                return True
+            if self._is_near_lasso_start(scene_pos):
+                if self._source_value is None or self._target_value is None:
+                    self._cancel_lasso()
+                    self.viewport().update()
+                    event.accept()
+                    return True
+                self._active_source = self._target_value
+                self._active_target = self._source_value
+                changed = self._finish_lasso()
+                if changed:
+                    self.labelEdited.emit()
+                event.accept()
+                return True
+            self._cancel_lasso()
+            self.viewport().update()
+            event.accept()
+            return True
+        return False
+
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         scene_pos = self.mapToScene(event.position().toPoint())
         self._hover_pos = scene_pos if self._within_image(scene_pos) else None
@@ -198,7 +257,11 @@ class LabelCanvas(QGraphicsView):
                     if changed:
                         self.labelEdited.emit()
                 self._last_paint_point = scene_pos
-        elif self._lasso_active and (event.buttons() & Qt.LeftButton):
+        elif (
+            self._tool_mode in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO)
+            and self._lasso_active
+            and (event.buttons() & Qt.LeftButton)
+        ):
             self._append_lasso_point(scene_pos)
             event.accept()
         self._update_lasso_start_hover()
@@ -237,13 +300,17 @@ class LabelCanvas(QGraphicsView):
             return
         inv_transform = self.transform().inverted()[0]
         unit = inv_transform.mapRect(QRectF(0, 0, 1, 1)).width()
-        if self._tool_mode in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO) and self._lasso_points:
+        if self._tool_mode in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO, ToolMode.POLYGON) and self._lasso_points:
             painter.save()
             path = QPolygonF(self._lasso_points)
             pen = QPen(QColor(255, 255, 255, 200), max(1.0, unit))
             painter.setPen(pen)
             painter.setBrush(QColor(255, 255, 255, 40) if self._lasso_active else Qt.NoBrush)
             painter.drawPolygon(path)
+            if self._tool_mode == ToolMode.POLYGON and self._lasso_active and self._hover_pos is not None:
+                preview_pen = QPen(QColor(200, 200, 200, 160), max(1.0, unit), Qt.DashLine)
+                painter.setPen(preview_pen)
+                painter.drawLine(self._lasso_points[-1], self._hover_pos)
             if self._lasso_active:
                 start_point = self._lasso_points[0]
                 start_radius = max(self._lasso_start_screen_radius * unit, 3.0 * unit)
@@ -344,7 +411,8 @@ class LabelCanvas(QGraphicsView):
 
     def _is_near_lasso_start(self, point: QPointF) -> bool:
         if (
-            self._tool_mode not in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO)
+            self._tool_mode
+            not in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO, ToolMode.POLYGON)
             or not self._lasso_points
         ):
             return False
@@ -357,7 +425,7 @@ class LabelCanvas(QGraphicsView):
     def _update_lasso_start_hover(self) -> None:
         hovering = False
         if (
-            self._tool_mode in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO)
+            self._tool_mode in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO, ToolMode.POLYGON)
             and self._lasso_points
             and self._hover_pos is not None
         ):

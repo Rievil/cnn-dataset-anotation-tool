@@ -106,6 +106,61 @@ def _restore_array(data: bytes, shape: Iterable[int], dtype: str) -> np.ndarray:
     return np.frombuffer(data, dtype=dtype).reshape(tuple(shape))
 
 
+def _flatten_optional(array: Optional[np.ndarray]) -> Tuple[Optional[bytes], Optional[List[int]], Optional[str]]:
+    if array is None:
+        return None, None, None
+    data, shape, dtype = _flatten_array(array)
+    return data, list(shape), dtype
+
+
+def _coerce_array_bytes(data: object) -> Optional[bytes]:
+    if data is None:
+        return None
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    if isinstance(data, memoryview):
+        return data.tobytes()
+    if isinstance(data, np.ndarray):
+        return data.tobytes()
+    return None
+
+
+def _coerce_shape(shape: object) -> Optional[Tuple[int, ...]]:
+    if shape is None:
+        return None
+    if isinstance(shape, (list, tuple)):
+        try:
+            return tuple(int(dim) for dim in shape)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(shape, np.ndarray):
+        try:
+            return tuple(int(dim) for dim in shape.tolist())
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _coerce_dtype(dtype: object) -> Optional[str]:
+    if dtype is None:
+        return None
+    if isinstance(dtype, str):
+        dtype = dtype.strip()
+        return dtype or None
+    if isinstance(dtype, np.dtype):
+        return str(dtype)
+    return None
+
+
+def _restore_optional_array(data: object, shape: object, dtype: object) -> Optional[np.ndarray]:
+    bytes_data = _coerce_array_bytes(data)
+    norm_shape = _coerce_shape(shape)
+    norm_dtype = _coerce_dtype(dtype)
+    if bytes_data is None or norm_shape is None or norm_dtype is None:
+        return None
+    return _restore_array(bytes_data, norm_shape, norm_dtype).copy()
+
+
 def save_entries_to_parquet(
     entries: Sequence[DatasetEntry],
     classes: Sequence[ClassDefinition],
@@ -121,21 +176,21 @@ def save_entries_to_parquet(
     )
     for entry in entries:
         img_bytes, img_shape, img_dtype = _flatten_array(entry.image)
-        orig_bytes, orig_shape, orig_dtype = _flatten_array(entry.original_label)
-        edit_bytes, edit_shape, edit_dtype = _flatten_array(entry.edited_label)
+        orig_bytes, orig_shape, orig_dtype = _flatten_optional(entry.original_label)
+        edit_bytes, edit_shape, edit_dtype = _flatten_optional(entry.edited_label)
         records.append(
             {
                 "name": entry.name,
                 "image_filename": entry.image_path.name,
-                "label_filename": entry.label_path.name,
+                "label_filename": entry.label_path.name if entry.label_path else None,
                 "image_bytes": img_bytes,
                 "image_shape": list(img_shape),
                 "image_dtype": img_dtype,
                 "original_bytes": orig_bytes,
-                "original_shape": list(orig_shape),
+                "original_shape": orig_shape,
                 "original_dtype": orig_dtype,
                 "edited_bytes": edit_bytes,
-                "edited_shape": list(edit_shape),
+                "edited_shape": edit_shape,
                 "edited_dtype": edit_dtype,
                 "classes_json": classes_payload,
                 "metadata_json": json.dumps({str(k): str(v) for k, v in (entry.metadata or {}).items()}),
@@ -168,16 +223,16 @@ def load_entries_from_parquet(path: Path) -> Tuple[List[DatasetEntry], Optional[
             classes = None
     for _, row in df.iterrows():
         image = _restore_array(row["image_bytes"], row["image_shape"], row["image_dtype"]).copy()
-        original = _restore_array(
-            row["original_bytes"],
-            row["original_shape"],
-            row["original_dtype"],
-        ).copy()
-        edited = _restore_array(
-            row["edited_bytes"],
-            row["edited_shape"],
-            row["edited_dtype"],
-        ).copy()
+        original = _restore_optional_array(
+            row.get("original_bytes") if hasattr(row, "get") else None,
+            row.get("original_shape") if hasattr(row, "get") else None,
+            row.get("original_dtype") if hasattr(row, "get") else None,
+        )
+        edited = _restore_optional_array(
+            row.get("edited_bytes") if hasattr(row, "get") else None,
+            row.get("edited_shape") if hasattr(row, "get") else None,
+            row.get("edited_dtype") if hasattr(row, "get") else None,
+        )
         metadata: Dict[str, str] = {}
         metadata_raw = row.get("metadata_json") if hasattr(row, "get") else None
         if isinstance(metadata_raw, (str, bytes)) and metadata_raw:
@@ -187,11 +242,18 @@ def load_entries_from_parquet(path: Path) -> Tuple[List[DatasetEntry], Optional[
                     metadata = {str(k): str(v) for k, v in decoded.items()}
             except (TypeError, ValueError, json.JSONDecodeError):
                 metadata = {}
+        label_filename = row.get("label_filename") if hasattr(row, "get") else None
+        if isinstance(label_filename, float) and np.isnan(label_filename):
+            label_filename = None
+        if label_filename in ("", None):
+            label_path = None
+        else:
+            label_path = Path(str(label_filename))
         entries.append(
             DatasetEntry(
                 name=str(row["name"]),
                 image_path=Path(str(row["image_filename"])),
-                label_path=Path(str(row["label_filename"])),
+                label_path=label_path,
                 image=image,
                 original_label=original,
                 edited_label=edited,

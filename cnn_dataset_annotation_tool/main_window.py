@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QImage, QPixmap, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -37,6 +37,8 @@ from .constants import fallback_color
 from .io_utils import (
     load_dataset_from_folders,
     load_entries_from_parquet,
+    load_label_image,
+    load_rgb_image,
     save_entries_to_parquet,
     save_label_image,
 )
@@ -70,10 +72,14 @@ class MainWindow(QMainWindow):
         # Dataset controls
         dataset_row = QHBoxLayout()
         self.load_button = QPushButton("Load Dataset")
+        self.add_image_button = QPushButton("Add Image")
+        self.load_mask_button = QPushButton("Load Mask")
         self.save_button = QPushButton("Save Session")
         self.revert_button = QPushButton("Revert Current Label")
         self.export_button = QPushButton("Export Edited Labels")
         dataset_row.addWidget(self.load_button)
+        dataset_row.addWidget(self.add_image_button)
+        dataset_row.addWidget(self.load_mask_button)
         dataset_row.addWidget(self.save_button)
         dataset_row.addWidget(self.revert_button)
         dataset_row.addWidget(self.export_button)
@@ -155,7 +161,8 @@ class MainWindow(QMainWindow):
         brush_hint = QLabel(
             "Brush: circular stroke. Hold Ctrl + mouse wheel to zoom, middle mouse to pan.\n"
             "Brush left click: source → target, right click: target → source.\n"
-            "Lasso: hold left to trace an area, release to fill. Right click cancels. Magnetic lasso snaps to edges."
+            "Lasso: hold left to trace an area, release to fill. Right click cancels. Magnetic lasso snaps to edges.\n"
+            "Polygon: click to place vertices, click the start point to close. Right click closes with swapped classes or cancels."
         )
         brush_hint.setWordWrap(True)
         control_layout.addWidget(brush_hint, 2, 0, 1, 3)
@@ -168,13 +175,17 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(QLabel("Target Class"), 4, 0)
         control_layout.addWidget(self.target_combo, 4, 1, 1, 2)
 
+        self.switch_classes_button = QPushButton("Switch Class Values")
+        control_layout.addWidget(self.switch_classes_button, 5, 0, 1, 3)
+
         # Tool selection
         self.tool_combo = QComboBox()
         self.tool_combo.addItem("Brush", ToolMode.BRUSH)
         self.tool_combo.addItem("Freehand Lasso", ToolMode.LASSO)
+        self.tool_combo.addItem("Polygon", ToolMode.POLYGON)
         self.tool_combo.addItem("Magnetic Lasso", ToolMode.MAGNETIC_LASSO)
-        control_layout.addWidget(QLabel("Editing Tool"), 5, 0)
-        control_layout.addWidget(self.tool_combo, 5, 1, 1, 2)
+        control_layout.addWidget(QLabel("Editing Tool"), 6, 0)
+        control_layout.addWidget(self.tool_combo, 6, 1, 1, 2)
 
         tools_layout.addWidget(control_panel)
 
@@ -240,6 +251,8 @@ class MainWindow(QMainWindow):
 
         # Signal wiring
         self.load_button.clicked.connect(self.load_dataset)
+        self.add_image_button.clicked.connect(self._add_single_image)
+        self.load_mask_button.clicked.connect(self._load_mask_for_current)
         self.save_button.clicked.connect(self.save_session)
         self.revert_button.clicked.connect(self.revert_current_label)
         self.export_button.clicked.connect(self.export_labels)
@@ -249,6 +262,7 @@ class MainWindow(QMainWindow):
         self.brush_spin.valueChanged.connect(self._handle_brush_spin_changed)
         self.source_combo.currentIndexChanged.connect(self._update_paint_values)
         self.target_combo.currentIndexChanged.connect(self._update_paint_values)
+        self.switch_classes_button.clicked.connect(self._switch_classes)
         self.tool_combo.currentIndexChanged.connect(self._handle_tool_changed)
         self.canvas.labelEdited.connect(self._handle_label_edited)
         self.class_manager.classesChanged.connect(self._handle_classes_changed)
@@ -345,6 +359,7 @@ class MainWindow(QMainWindow):
         self.description_table.setRowCount(0)
         for entry in entries:
             item = QListWidgetItem(entry.name)
+            self._style_image_list_item(item, entry)
             self.image_list.addItem(item)
         self.dataset_status.setText(status_text)
         self._session_dirty = False
@@ -369,6 +384,127 @@ class MainWindow(QMainWindow):
                 self.class_manager.set_classes([])
             finally:
                 self._suppress_class_dirty = False
+
+    def _style_image_list_item(self, item: QListWidgetItem, entry: DatasetEntry) -> None:
+        if entry.has_label:
+            item.setForeground(self.image_list.palette().brush(QPalette.Text))
+            item.setToolTip("")
+        else:
+            item.setForeground(Qt.red)
+            item.setToolTip("Mask not loaded")
+
+    def _refresh_image_list_styles(self) -> None:
+        for idx in range(min(self.image_list.count(), len(self.entries))):
+            item = self.image_list.item(idx)
+            if item is not None:
+                self._style_image_list_item(item, self.entries[idx])
+
+    def _ensure_unique_entry_name(self, base_name: str) -> str:
+        existing = {entry.name for entry in self.entries}
+        candidate = base_name
+        suffix = 1
+        while candidate in existing:
+            candidate = f"{base_name}_{suffix}"
+            suffix += 1
+        return candidate
+
+    def _add_single_image(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select image file",
+            str(self._session_path.parent) if self._session_path else str(Path.cwd()),
+            "Image Files (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+        path = Path(file_path)
+        try:
+            image = load_rgb_image(path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Image load failed", f"Could not load image:\n{exc}")
+            return
+
+        name = self._ensure_unique_entry_name(path.stem)
+        entry = DatasetEntry(
+            name=name,
+            image_path=path,
+            label_path=None,
+            image=image,
+            original_label=None,
+            edited_label=None,
+            metadata={},
+        )
+        self.entries.append(entry)
+        item = QListWidgetItem(entry.name)
+        self._style_image_list_item(item, entry)
+        self.image_list.addItem(item)
+        self.dataset_status.setText(f"{len(self.entries)} item(s) in session")
+        self._session_dirty = True
+        self.set_current_index(len(self.entries) - 1)
+        self.statusBar().showMessage(f"Added image {entry.name}", 4000)
+
+    def _load_mask_for_current(self) -> None:
+        if self.current_index is None or self.current_index < 0 or self.current_index >= len(self.entries):
+            QMessageBox.information(self, "No image selected", "Select an image before loading a mask.")
+            return
+
+        entry = self.entries[self.current_index]
+        start_dir = (
+            str(entry.label_path.parent)
+            if entry.label_path is not None
+            else str(entry.image_path.parent)
+            if entry.image_path.exists()
+            else str(Path.cwd())
+        )
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Select mask for {entry.name}",
+            start_dir,
+            "Label Files (*.png *.tif *.tiff *.bmp);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+        path = Path(file_path)
+        try:
+            label = load_label_image(path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Mask load failed", f"Could not load mask:\n{exc}")
+            return
+
+        if label.shape != entry.image.shape[:2]:
+            QMessageBox.critical(
+                self,
+                "Size mismatch",
+                (
+                    f"Mask dimensions {label.shape[1]}x{label.shape[0]} do not match image dimensions "
+                    f"{entry.image.shape[1]}x{entry.image.shape[0]}."
+                ),
+            )
+            return
+
+        if entry.has_label:
+            confirm = QMessageBox.question(
+                self,
+                "Replace existing mask?",
+                (
+                    "This image already has a mask. Replacing it will discard any edits "
+                    "you have made. Continue?"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return
+
+        entry.label_path = path
+        entry.original_label = label
+        entry.edited_label = label.copy()
+        self._session_dirty = True
+        item = self.image_list.item(self.current_index)
+        if item is not None:
+            self._style_image_list_item(item, entry)
+        self._refresh_canvas()
+        self.statusBar().showMessage(f"Loaded mask for {entry.name}", 4000)
 
     def save_session(self, prompt_for_path: bool = True) -> bool:
         if not self.entries:
@@ -573,10 +709,79 @@ class MainWindow(QMainWindow):
         self.target_combo.blockSignals(False)
         self._update_paint_values()
 
+    def _class_label_for_value(self, value: int) -> str:
+        for cls in self.class_manager.get_classes():
+            if cls.value == value:
+                return f"{cls.name} ({cls.value})"
+        return str(value)
+
     def _update_paint_values(self) -> None:
         source = self.source_combo.currentData()
         target = self.target_combo.currentData()
         self.canvas.set_paint_values(source, target)
+
+    def _switch_classes(self) -> None:
+        if self.current_index is None:
+            QMessageBox.information(self, "No image selected", "Select an entry before switching classes.")
+            return
+        source_value = self.source_combo.currentData()
+        target_value = self.target_combo.currentData()
+        if source_value is None or target_value is None:
+            QMessageBox.information(
+                self,
+                "Selection required",
+                "Pick specific source and target classes before switching their values.",
+            )
+            return
+        if source_value == target_value:
+            QMessageBox.information(
+                self,
+                "Same class selected",
+                "Choose two different classes to perform a switch.",
+            )
+            return
+        entry = self.entries[self.current_index]
+        if not entry.has_label or entry.edited_label is None:
+            QMessageBox.information(
+                self,
+                "Mask required",
+                "Load a mask for this image before switching classes.",
+            )
+            return
+        source_label = self._class_label_for_value(source_value)
+        target_label = self._class_label_for_value(target_value)
+        confirm = QMessageBox.question(
+            self,
+            "Switch classes",
+            (
+                "Switch all pixels labeled\n"
+                f"- {source_label}\n"
+                f"- {target_label}\n"
+                f"in {entry.name}? This updates the edited label only."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        label = entry.edited_label
+        src_mask = label == int(source_value)
+        dst_mask = label == int(target_value)
+        if not (np.any(src_mask) or np.any(dst_mask)):
+            QMessageBox.information(
+                self,
+                "Nothing to change",
+                "Neither class appears in the current edited label.",
+            )
+            return
+        label[src_mask] = int(target_value)
+        label[dst_mask] = int(source_value)
+        self._session_dirty = True
+        self._refresh_canvas()
+        self.statusBar().showMessage(
+            f"Swapped {source_label} and {target_label} in {entry.name}",
+            4000,
+        )
 
     def _auto_populate_classes(self) -> None:
         if not self.entries:
@@ -584,6 +789,8 @@ class MainWindow(QMainWindow):
             return
         values: List[int] = []
         for entry in self.entries:
+            if entry.original_label is None:
+                continue
             values.extend(np.unique(entry.original_label).tolist())
         unique_values = sorted(set(values))
         self.class_manager.populate_from_values(unique_values)
@@ -598,6 +805,13 @@ class MainWindow(QMainWindow):
         if self.current_index is None:
             return
         entry = self.entries[self.current_index]
+        if entry.original_label is None:
+            QMessageBox.information(
+                self,
+                "No mask",
+                "Load a mask for this image before reverting edits.",
+            )
+            return
         entry.reset_edits()
         self._session_dirty = True
         self._refresh_canvas()
@@ -612,7 +826,11 @@ class MainWindow(QMainWindow):
             return
         dest_path = Path(destination)
         exported = 0
+        skipped: List[str] = []
         for entry in self.entries:
+            if entry.edited_label is None or entry.label_path is None:
+                skipped.append(entry.name)
+                continue
             output_path = dest_path / entry.label_path.name
             try:
                 save_label_image(entry.edited_label, output_path)
@@ -623,7 +841,10 @@ class MainWindow(QMainWindow):
                     "Export warning",
                     f"Failed to export {entry.name}: {exc}",
                 )
-        self.statusBar().showMessage(f"Exported {exported} label(s) to {dest_path}", 5000)
+        message = f"Exported {exported} label(s) to {dest_path}"
+        if skipped:
+            message += f"; skipped {len(skipped)} without masks"
+        self.statusBar().showMessage(message, 5000)
 
     # ----- Rendering --------------------------------------------------------
     def _refresh_canvas(self) -> None:
@@ -647,29 +868,35 @@ class MainWindow(QMainWindow):
     def _render_overlay(
         self,
         image: np.ndarray,
-        labels: np.ndarray,
+        labels: Optional[np.ndarray],
         classes: Sequence[ClassDefinition],
         alpha: float,
     ) -> QPixmap:
         image_rgb = np.asarray(image, dtype=np.float32)
         if image_rgb.ndim == 2:
             image_rgb = np.stack([image_rgb] * 3, axis=-1)
-        color_map: Dict[int, Tuple[int, int, int]] = {cls.value: cls.color_tuple() for cls in classes}
-        label_values = np.asarray(labels, dtype=np.int32)
-        unique_values = np.unique(label_values)
-        if unique_values.size == 0:
-            color_overlay = np.zeros((*label_values.shape, 3), dtype=np.float32)
-        else:
-            colors = np.array(
-                [color_map.get(int(value), fallback_color(int(value))) for value in unique_values],
-                dtype=np.float32,
-            )
-            indices = unique_values.searchsorted(label_values)
-            color_overlay = colors[indices]
-
         blend_alpha = np.clip(alpha, 0.0, 1.0)
-        blended = image_rgb * (1.0 - blend_alpha) + color_overlay * blend_alpha
-        blended = np.clip(blended, 0, 255).astype(np.uint8)
+        if labels is None or labels.size == 0 or blend_alpha <= 0.0:
+            blended = np.clip(image_rgb, 0, 255).astype(np.uint8)
+        else:
+            color_map: Dict[int, Tuple[int, int, int]] = {cls.value: cls.color_tuple() for cls in classes}
+            label_values = np.asarray(labels, dtype=np.int32)
+            if label_values.shape != image_rgb.shape[:2]:
+                blended = np.clip(image_rgb, 0, 255).astype(np.uint8)
+            else:
+                unique_values = np.unique(label_values)
+                if unique_values.size == 0:
+                    color_overlay = np.zeros((*label_values.shape, 3), dtype=np.float32)
+                else:
+                    colors = np.array(
+                        [color_map.get(int(value), fallback_color(int(value))) for value in unique_values],
+                        dtype=np.float32,
+                    )
+                    indices = unique_values.searchsorted(label_values)
+                    color_overlay = colors[indices]
+
+                blended = image_rgb * (1.0 - blend_alpha) + color_overlay * blend_alpha
+                blended = np.clip(blended, 0, 255).astype(np.uint8)
         height, width, _ = blended.shape
         bytes_per_line = 3 * width
         qimage = QImage(blended.data, width, height, bytes_per_line, QImage.Format_RGB888)
