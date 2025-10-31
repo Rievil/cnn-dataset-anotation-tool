@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import math
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QWidget
+
+from .models import EditOperation
 
 class ToolMode(Enum):
     BRUSH = "brush"
@@ -20,6 +22,7 @@ class LabelCanvas(QGraphicsView):
     """Interactive canvas visualizing the image/label overlay."""
 
     labelEdited = Signal()
+    operationPerformed = Signal(object)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -53,6 +56,8 @@ class LabelCanvas(QGraphicsView):
         self._lasso_start_hover = False
         self._lasso_start_screen_radius = 6.0
         self._lasso_start_hover_margin = 2.0
+        self._pending_operation_desc: Optional[str] = None
+        self._pending_operation_pixels: Dict[Tuple[int, int], Tuple[int, int]] = {}
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
         self._pixmap_item.setPixmap(pixmap)
@@ -104,6 +109,65 @@ class LabelCanvas(QGraphicsView):
         self._hover_pos = None
         self.viewport().update()
 
+    def _format_value(self, value: Optional[int]) -> str:
+        return "any" if value is None else str(int(value))
+
+    def _operation_base_name(self) -> str:
+        if self._tool_mode == ToolMode.LASSO:
+            return "Freehand Lasso"
+        if self._tool_mode == ToolMode.MAGNETIC_LASSO:
+            return "Magnetic Lasso"
+        if self._tool_mode == ToolMode.POLYGON:
+            return "Polygon"
+        return "Brush"
+
+    def _begin_operation(self, description: str) -> None:
+        self._pending_operation_desc = description
+        self._pending_operation_pixels = {}
+
+    def _record_pixel_change(self, row: int, col: int, previous: int, new: int) -> None:
+        if self._pending_operation_desc is None:
+            return
+        coord = (int(row), int(col))
+        if coord not in self._pending_operation_pixels:
+            self._pending_operation_pixels[coord] = (int(previous), int(new))
+        else:
+            prev = self._pending_operation_pixels[coord][0]
+            self._pending_operation_pixels[coord] = (prev, int(new))
+
+    def _emit_operation_from_pending(self) -> None:
+        if not self._pending_operation_pixels or self._pending_operation_desc is None:
+            self._clear_pending_operation()
+            return
+        ordered = list(self._pending_operation_pixels.items())
+        coords = np.array([coord for coord, _ in ordered], dtype=np.int32)
+        previous = np.array([values[0] for _, values in ordered], dtype=np.int32)
+        new_values = np.array([values[1] for _, values in ordered], dtype=np.int32)
+        operation = EditOperation(self._pending_operation_desc, coords, previous, new_values)
+        self.operationPerformed.emit(operation)
+        self._clear_pending_operation()
+
+    def _emit_operation_from_arrays(
+        self,
+        description: str,
+        coords: np.ndarray,
+        previous: np.ndarray,
+        new_values: np.ndarray,
+    ) -> None:
+        if coords.size == 0:
+            return
+        operation = EditOperation(
+            description,
+            np.array(coords, dtype=np.int32, copy=True),
+            np.array(previous, dtype=np.int32, copy=True),
+            np.array(new_values, dtype=np.int32, copy=True),
+        )
+        self.operationPerformed.emit(operation)
+
+    def _clear_pending_operation(self) -> None:
+        self._pending_operation_desc = None
+        self._pending_operation_pixels = {}
+
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         if event.modifiers() & Qt.ControlModifier:
             factor = 1.25 if event.angleDelta().y() > 0 else 0.8
@@ -129,6 +193,10 @@ class LabelCanvas(QGraphicsView):
                 scene_pos = self.mapToScene(event.position().toPoint())
                 if not self._within_image(scene_pos):
                     return
+                description = (
+                    f"Brush {self._format_value(active_source)}→{self._format_value(active_target)}"
+                )
+                self._begin_operation(description)
                 changed = self._apply_brush(scene_pos, active_source, active_target)
                 if changed:
                     self.labelEdited.emit()
@@ -159,9 +227,19 @@ class LabelCanvas(QGraphicsView):
                                 return
                             self._active_source = self._target_value
                             self._active_target = self._source_value
-                        changed = self._finish_lasso()
-                        if changed:
+                        source_display = self._format_value(self._active_source)
+                        target_display = self._format_value(self._active_target)
+                        is_reverse = event.button() == Qt.RightButton
+                        result = self._finish_lasso()
+                        if result is not None:
+                            coords, previous_values, new_values = result
+                            description = (
+                                f"{self._operation_base_name()} {source_display}→{target_display}"
+                            )
+                            if is_reverse:
+                                description += " (reverse)"
                             self.labelEdited.emit()
+                            self._emit_operation_from_arrays(description, coords, previous_values, new_values)
                         event.accept()
                         return
                     self._cancel_lasso()
@@ -271,6 +349,7 @@ class LabelCanvas(QGraphicsView):
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if self._tool_mode == ToolMode.BRUSH:
             if event.button() in (Qt.LeftButton, Qt.RightButton):
+                self._emit_operation_from_pending()
                 self._painting = False
                 self._painting_button = None
                 self._active_source = None
@@ -376,7 +455,7 @@ class LabelCanvas(QGraphicsView):
         else:
             self._lasso_points[-1] = snapped
 
-    def _finish_lasso(self) -> bool:
+    def _finish_lasso(self) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         if (
             not self._lasso_active
             or not self._lasso_points
@@ -384,18 +463,18 @@ class LabelCanvas(QGraphicsView):
             or self._label_array is None
         ):
             self._cancel_lasso()
-            return False
+            return None
         if len(self._lasso_points) < 3:
             self._cancel_lasso()
-            return False
-        changed = self._apply_polygon(
+            return None
+        result = self._apply_polygon(
             self._lasso_points,
             self._active_source,
             self._active_target,
         )
         self._cancel_lasso()
         self.viewport().update()
-        return changed
+        return result
 
     def _scene_unit(self) -> float:
         transform = self.transform()
@@ -443,12 +522,12 @@ class LabelCanvas(QGraphicsView):
         points: List[QPointF],
         source_value: Optional[int],
         target_value: Optional[int],
-    ) -> bool:
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         if self._label_array is None or target_value is None or not points:
-            return False
+            return None
         height, width = self._label_array.shape
         if width == 0 or height == 0:
-            return False
+            return None
         mask_image = QImage(width, height, QImage.Format_Grayscale8)
         mask_image.fill(0)
         painter = QPainter(mask_image)
@@ -470,9 +549,15 @@ class LabelCanvas(QGraphicsView):
         else:
             selection = mask
         if not np.any(selection):
-            return False
-        self._label_array[selection] = target_value
-        return True
+            return None
+        different = np.logical_and(selection, self._label_array != target_value)
+        if not np.any(different):
+            return None
+        coords = np.argwhere(different)
+        previous_values = self._label_array[different].astype(np.int32, copy=True)
+        self._label_array[different] = target_value
+        new_values = np.full(previous_values.shape, int(target_value), dtype=np.int32)
+        return coords, previous_values, new_values
 
     def _snap_to_edge(self, point: QPointF) -> QPointF:
         if self._tool_mode != ToolMode.MAGNETIC_LASSO or self._gradient_map is None:
@@ -505,6 +590,7 @@ class LabelCanvas(QGraphicsView):
         self._last_paint_point = None
         self._painting = False
         self._lasso_start_hover = False
+        self._clear_pending_operation()
 
     def _apply_brush(
         self,
@@ -538,5 +624,6 @@ class LabelCanvas(QGraphicsView):
                 if current_value == target_value:
                     continue
                 self._label_array[y, x] = target_value
+                self._record_pixel_change(y, x, current_value, int(target_value))
                 changed = True
         return changed

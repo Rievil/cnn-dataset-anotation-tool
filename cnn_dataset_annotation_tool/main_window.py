@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPixmap, QPalette
+from PySide6.QtGui import QImage, QKeySequence, QPixmap, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -43,7 +43,7 @@ from .io_utils import (
     save_label_image,
 )
 from .label_canvas import LabelCanvas, ToolMode
-from .models import ClassDefinition, DatasetEntry
+from .models import ClassDefinition, DatasetEntry, EditOperation
 
 
 class MainWindow(QMainWindow):
@@ -241,6 +241,16 @@ class MainWindow(QMainWindow):
 
         self.controls_tabs.addTab(description_tab, "Description")
 
+        history_tab = QWidget()
+        history_layout = QVBoxLayout(history_tab)
+        history_layout.setContentsMargins(8, 8, 8, 8)
+        history_layout.setSpacing(8)
+        history_layout.addWidget(QLabel("Edit history for the selected image:"))
+        self.history_list = QListWidget()
+        self.history_list.setSelectionMode(QAbstractItemView.NoSelection)
+        history_layout.addWidget(self.history_list, 1)
+        self.controls_tabs.addTab(history_tab, "History")
+
         self.splitter.addWidget(self.controls_container)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
@@ -265,6 +275,7 @@ class MainWindow(QMainWindow):
         self.switch_classes_button.clicked.connect(self._switch_classes)
         self.tool_combo.currentIndexChanged.connect(self._handle_tool_changed)
         self.canvas.labelEdited.connect(self._handle_label_edited)
+        self.canvas.operationPerformed.connect(self._record_operation)
         self.class_manager.classesChanged.connect(self._handle_classes_changed)
         self.class_manager.autoPopulateRequested.connect(self._auto_populate_classes)
         self.edited_radio.toggled.connect(self._handle_label_view_toggled)
@@ -273,11 +284,19 @@ class MainWindow(QMainWindow):
         self.remove_description_row_button.clicked.connect(self._remove_description_row)
         self.controls_toggle_button.toggled.connect(self._handle_controls_toggled)
 
+        self._undo_shortcut = QShortcut(QKeySequence.Undo, self)
+        self._undo_shortcut.activated.connect(self._undo_current)
+        self._redo_shortcut = QShortcut(QKeySequence.Redo, self)
+        self._redo_shortcut.activated.connect(self._redo_current)
+        self._redo_alt_shortcut = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self._redo_alt_shortcut.activated.connect(self._redo_current)
+
         self._update_paint_values()
         self._handle_tool_changed(self.tool_combo.currentIndex())
         self._set_controls_visible(True)
         self._update_controls_toggle_text(True)
         self._update_label_view_status()
+        self._update_history_view()
 
     # ----- Dataset handling -------------------------------------------------
     def load_dataset(self) -> None:
@@ -499,11 +518,14 @@ class MainWindow(QMainWindow):
         entry.label_path = path
         entry.original_label = label
         entry.edited_label = label.copy()
+        entry.undo_stack.clear()
+        entry.redo_stack.clear()
         self._session_dirty = True
         item = self.image_list.item(self.current_index)
         if item is not None:
             self._style_image_list_item(item, entry)
         self._refresh_canvas()
+        self._update_history_view()
         self.statusBar().showMessage(f"Loaded mask for {entry.name}", 4000)
 
     def save_session(self, prompt_for_path: bool = True) -> bool:
@@ -545,6 +567,7 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= len(self.entries):
             self.current_index = None
             self.canvas.clear()
+            self._update_history_view()
             return
         self.current_index = row
         self.image_list.setCurrentRow(row)
@@ -553,6 +576,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Viewing {current_entry.name} ({row + 1}/{len(self.entries)})"
         )
+        self._update_history_view()
 
     # ----- UI state updates -------------------------------------------------
     def _handle_alpha_changed(self, value: int) -> None:
@@ -774,14 +798,122 @@ class MainWindow(QMainWindow):
                 "Neither class appears in the current edited label.",
             )
             return
+        coords_src = np.argwhere(src_mask)
+        coords_dst = np.argwhere(dst_mask)
+        coords = np.vstack([coords_src, coords_dst]) if coords_dst.size else coords_src
+        prev_values = np.concatenate(
+            [
+                np.full(coords_src.shape[0], int(source_value), dtype=np.int32),
+                np.full(coords_dst.shape[0], int(target_value), dtype=np.int32),
+            ]
+        ) if coords_dst.size else np.full(coords_src.shape[0], int(source_value), dtype=np.int32)
+        new_values = np.concatenate(
+            [
+                np.full(coords_src.shape[0], int(target_value), dtype=np.int32),
+                np.full(coords_dst.shape[0], int(source_value), dtype=np.int32),
+            ]
+        ) if coords_dst.size else np.full(coords_src.shape[0], int(target_value), dtype=np.int32)
         label[src_mask] = int(target_value)
         label[dst_mask] = int(source_value)
-        self._session_dirty = True
+        operation = EditOperation(
+            f"Swap {source_label} ↔ {target_label}",
+            coords.astype(np.int32, copy=True),
+            prev_values.astype(np.int32, copy=False),
+            new_values.astype(np.int32, copy=False),
+        )
+        self._record_operation(operation)
         self._refresh_canvas()
         self.statusBar().showMessage(
             f"Swapped {source_label} and {target_label} in {entry.name}",
             4000,
         )
+
+    def _record_operation(self, operation: EditOperation) -> None:
+        if self.current_index is None or self.current_index >= len(self.entries):
+            return
+        entry = self.entries[self.current_index]
+        if entry.edited_label is None:
+            return
+        entry.undo_stack.append(operation)
+        entry.redo_stack.clear()
+        self._session_dirty = True
+        self._update_history_view()
+        count = operation.pixel_count()
+        summary = f"{operation.description} ({count} px)" if count else operation.description
+        self.statusBar().showMessage(summary, 2500)
+
+    def _apply_operation(self, entry: DatasetEntry, operation: EditOperation, *, forward: bool) -> None:
+        if entry.edited_label is None:
+            return
+        coords = operation.coordinates
+        if coords.size == 0:
+            return
+        rows = coords[:, 0]
+        cols = coords[:, 1]
+        values = operation.new_values if forward else operation.previous_values
+        entry.edited_label[rows, cols] = values
+
+    def _undo_current(self) -> None:
+        if self.current_index is None or self.current_index >= len(self.entries):
+            return
+        entry = self.entries[self.current_index]
+        if not entry.undo_stack:
+            return
+        operation = entry.undo_stack.pop()
+        self._apply_operation(entry, operation, forward=False)
+        entry.redo_stack.append(operation)
+        self._session_dirty = True
+        self._refresh_canvas()
+        self._update_history_view()
+        self.statusBar().showMessage(f"Undid {operation.description}", 2500)
+
+    def _redo_current(self) -> None:
+        if self.current_index is None or self.current_index >= len(self.entries):
+            return
+        entry = self.entries[self.current_index]
+        if not entry.redo_stack:
+            return
+        operation = entry.redo_stack.pop()
+        self._apply_operation(entry, operation, forward=True)
+        entry.undo_stack.append(operation)
+        self._session_dirty = True
+        self._refresh_canvas()
+        self._update_history_view()
+        self.statusBar().showMessage(f"Redid {operation.description}", 2500)
+
+    def _update_history_view(self) -> None:
+        self.history_list.clear()
+        if self.current_index is None or self.current_index >= len(self.entries):
+            item = QListWidgetItem("No image selected.")
+            item.setFlags(Qt.ItemIsEnabled)
+            self.history_list.addItem(item)
+            return
+        entry = self.entries[self.current_index]
+        if not entry.undo_stack and not entry.redo_stack:
+            item = QListWidgetItem("No edits recorded yet.")
+            item.setFlags(Qt.ItemIsEnabled)
+            self.history_list.addItem(item)
+            return
+        for index, operation in enumerate(entry.undo_stack, start=1):
+            count = operation.pixel_count()
+            text = f"{index}. {operation.description} ({count} px)" if count else f"{index}. {operation.description}"
+            item = QListWidgetItem(text)
+            item.setFlags(Qt.ItemIsEnabled)
+            item.setToolTip(f"{count} pixel(s) affected" if count else operation.description)
+            self.history_list.addItem(item)
+        if entry.redo_stack:
+            separator = QListWidgetItem("Redo queue:")
+            separator.setFlags(Qt.ItemIsEnabled)
+            separator.setForeground(Qt.gray)
+            self.history_list.addItem(separator)
+            for operation in reversed(entry.redo_stack):
+                count = operation.pixel_count()
+                text = f"↩ {operation.description} ({count} px)" if count else f"↩ {operation.description}"
+                item = QListWidgetItem(text)
+                item.setFlags(Qt.ItemIsEnabled)
+                item.setForeground(Qt.gray)
+                item.setToolTip(f"{count} pixel(s) pending redo" if count else operation.description)
+                self.history_list.addItem(item)
 
     def _auto_populate_classes(self) -> None:
         if not self.entries:
@@ -815,6 +947,7 @@ class MainWindow(QMainWindow):
         entry.reset_edits()
         self._session_dirty = True
         self._refresh_canvas()
+        self._update_history_view()
         self.statusBar().showMessage(f"Reverted edits for {entry.name}", 3000)
 
     def export_labels(self) -> None:
