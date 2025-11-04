@@ -58,6 +58,18 @@ def save_label_image(array: np.ndarray, path: Path) -> None:
     Image.fromarray(data).save(path)
 
 
+def save_rgb_image(array: np.ndarray, path: Path) -> None:
+    """Persist an RGB (or grayscale) image to disk as uint8."""
+    data = np.asarray(array)
+    if data.ndim == 2:
+        image = Image.fromarray(data.astype(np.uint8, copy=False), mode="L")
+    elif data.ndim == 3 and data.shape[2] == 3:
+        image = Image.fromarray(data.astype(np.uint8, copy=False), mode="RGB")
+    else:
+        raise ValueError("Image array must be 2D grayscale or 3-channel RGB")
+    image.save(path)
+
+
 def load_dataset_from_folders(image_dir: Path, label_dir: Path) -> Tuple[List[DatasetEntry], List[str]]:
     """Load dataset entries from folder pairs, returning entries and any error messages."""
     image_files = collect_files(image_dir, DATA_EXTENSIONS)
@@ -175,14 +187,15 @@ def save_entries_to_parquet(
         ]
     )
     for entry in entries:
-        img_bytes, img_shape, img_dtype = _flatten_array(entry.image)
+        img_bytes, img_shape, img_dtype = _flatten_optional(entry.image)
         orig_bytes, orig_shape, orig_dtype = _flatten_optional(entry.original_label)
         edit_bytes, edit_shape, edit_dtype = _flatten_optional(entry.edited_label)
         records.append(
             {
                 "name": entry.name,
-                "image_filename": entry.image_path.name,
+                "image_filename": entry.image_path.name if entry.image_path else None,
                 "label_filename": entry.label_path.name if entry.label_path else None,
+                "export_selected": bool(entry.export_selected),
                 "image_bytes": img_bytes,
                 "image_shape": list(img_shape),
                 "image_dtype": img_dtype,
@@ -222,7 +235,11 @@ def load_entries_from_parquet(path: Path) -> Tuple[List[DatasetEntry], Optional[
         except (ValueError, TypeError, json.JSONDecodeError):
             classes = None
     for _, row in df.iterrows():
-        image = _restore_array(row["image_bytes"], row["image_shape"], row["image_dtype"]).copy()
+        image = _restore_optional_array(
+            row.get("image_bytes") if hasattr(row, "get") else row["image_bytes"],
+            row.get("image_shape") if hasattr(row, "get") else row["image_shape"],
+            row.get("image_dtype") if hasattr(row, "get") else row["image_dtype"],
+        )
         original = _restore_optional_array(
             row.get("original_bytes") if hasattr(row, "get") else None,
             row.get("original_shape") if hasattr(row, "get") else None,
@@ -249,15 +266,27 @@ def load_entries_from_parquet(path: Path) -> Tuple[List[DatasetEntry], Optional[
             label_path = None
         else:
             label_path = Path(str(label_filename))
+        image_filename = row.get("image_filename") if hasattr(row, "get") else None
+        if isinstance(image_filename, float) and np.isnan(image_filename):
+            image_filename = None
+        image_path = Path(str(image_filename)) if image_filename not in (None, "") else None
+        export_selected_obj = row.get("export_selected") if hasattr(row, "get") else None
+        if isinstance(export_selected_obj, (bool, np.bool_)):
+            export_selected = bool(export_selected_obj)
+        elif isinstance(export_selected_obj, (int, float)):
+            export_selected = bool(export_selected_obj)
+        else:
+            export_selected = False
         entries.append(
             DatasetEntry(
                 name=str(row["name"]),
-                image_path=Path(str(row["image_filename"])),
+                image_path=image_path,
                 label_path=label_path,
                 image=image,
                 original_label=original,
                 edited_label=edited,
                 metadata=metadata,
+                export_selected=export_selected,
             )
         )
     return entries, classes

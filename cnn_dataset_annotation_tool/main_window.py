@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QKeySequence, QPixmap, QPalette, QShortcut
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QColor, QImage, QKeySequence, QPixmap, QPalette, QShortcut, QBrush
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -41,6 +42,7 @@ from .io_utils import (
     load_rgb_image,
     save_entries_to_parquet,
     save_label_image,
+    save_rgb_image,
 )
 from .label_canvas import LabelCanvas, ToolMode
 from .models import ClassDefinition, DatasetEntry, EditOperation
@@ -76,7 +78,7 @@ class MainWindow(QMainWindow):
         self.load_mask_button = QPushButton("Load Mask")
         self.save_button = QPushButton("Save Session")
         self.revert_button = QPushButton("Revert Current Label")
-        self.export_button = QPushButton("Export Edited Labels")
+        self.export_button = QPushButton("Export Images && Labels")
         dataset_row.addWidget(self.load_button)
         dataset_row.addWidget(self.add_image_button)
         dataset_row.addWidget(self.load_mask_button)
@@ -102,6 +104,8 @@ class MainWindow(QMainWindow):
         left_layout.setSpacing(6)
         left_layout.addWidget(QLabel("<b>Image Pairs</b>"))
         self.image_list = QListWidget()
+        self.image_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.image_list.customContextMenuRequested.connect(self._show_image_list_context_menu)
         left_layout.addWidget(self.image_list, 1)
         self.splitter.addWidget(left_panel)
 
@@ -157,35 +161,43 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.brush_slider, 1, 1)
         control_layout.addWidget(self.brush_spin, 1, 2)
 
+        self.polyline_thickness_label = QLabel(
+            f"Line Thickness: {self.canvas.polyline_width()} px"
+        )
+        control_layout.addWidget(self.polyline_thickness_label, 2, 0, 1, 3)
+        self.polyline_thickness_label.setVisible(False)
+
         # Brush info
         brush_hint = QLabel(
             "Brush: circular stroke. Hold Ctrl + mouse wheel to zoom, middle mouse to pan.\n"
             "Brush left click: source → target, right click: target → source.\n"
             "Lasso: hold left to trace an area, release to fill. Right click cancels. Magnetic lasso snaps to edges.\n"
-            "Polygon: click to place vertices, click the start point to close. Right click closes with swapped classes or cancels."
+            "Polygon: click to place vertices, click the start point to close. Right click closes with swapped classes or cancels.\n"
+            "Polygon Line: click to place points along the crack. Mouse wheel adjusts thickness. Close on the start point to apply; right click reverses classes."
         )
         brush_hint.setWordWrap(True)
-        control_layout.addWidget(brush_hint, 2, 0, 1, 3)
+        control_layout.addWidget(brush_hint, 3, 0, 1, 3)
 
         # Source / target selection
         self.source_combo = QComboBox()
         self.target_combo = QComboBox()
-        control_layout.addWidget(QLabel("Source Class"), 3, 0)
-        control_layout.addWidget(self.source_combo, 3, 1, 1, 2)
-        control_layout.addWidget(QLabel("Target Class"), 4, 0)
-        control_layout.addWidget(self.target_combo, 4, 1, 1, 2)
+        control_layout.addWidget(QLabel("Source Class"), 4, 0)
+        control_layout.addWidget(self.source_combo, 4, 1, 1, 2)
+        control_layout.addWidget(QLabel("Target Class"), 5, 0)
+        control_layout.addWidget(self.target_combo, 5, 1, 1, 2)
 
         self.switch_classes_button = QPushButton("Switch Class Values")
-        control_layout.addWidget(self.switch_classes_button, 5, 0, 1, 3)
+        control_layout.addWidget(self.switch_classes_button, 6, 0, 1, 3)
 
         # Tool selection
         self.tool_combo = QComboBox()
         self.tool_combo.addItem("Brush", ToolMode.BRUSH)
         self.tool_combo.addItem("Freehand Lasso", ToolMode.LASSO)
         self.tool_combo.addItem("Polygon", ToolMode.POLYGON)
+        self.tool_combo.addItem("Polygon Line", ToolMode.POLYLINE)
         self.tool_combo.addItem("Magnetic Lasso", ToolMode.MAGNETIC_LASSO)
-        control_layout.addWidget(QLabel("Editing Tool"), 6, 0)
-        control_layout.addWidget(self.tool_combo, 6, 1, 1, 2)
+        control_layout.addWidget(QLabel("Editing Tool"), 7, 0)
+        control_layout.addWidget(self.tool_combo, 7, 1, 1, 2)
 
         tools_layout.addWidget(control_panel)
 
@@ -276,6 +288,7 @@ class MainWindow(QMainWindow):
         self.tool_combo.currentIndexChanged.connect(self._handle_tool_changed)
         self.canvas.labelEdited.connect(self._handle_label_edited)
         self.canvas.operationPerformed.connect(self._record_operation)
+        self.canvas.polylineWidthChanged.connect(self._handle_polyline_width_changed)
         self.class_manager.classesChanged.connect(self._handle_classes_changed)
         self.class_manager.autoPopulateRequested.connect(self._auto_populate_classes)
         self.edited_radio.toggled.connect(self._handle_label_view_toggled)
@@ -405,18 +418,171 @@ class MainWindow(QMainWindow):
                 self._suppress_class_dirty = False
 
     def _style_image_list_item(self, item: QListWidgetItem, entry: DatasetEntry) -> None:
-        if entry.has_label:
-            item.setForeground(self.image_list.palette().brush(QPalette.Text))
-            item.setToolTip("")
-        else:
+        has_image = entry.has_image
+        has_label = entry.has_label
+        base_foreground = self.image_list.palette().brush(QPalette.Text)
+        base_background = self.image_list.palette().brush(QPalette.Base)
+        item.setForeground(base_foreground)
+        item.setBackground(base_background)
+        tooltip_parts: List[str] = []
+        if not (has_image and has_label):
             item.setForeground(Qt.red)
-            item.setToolTip("Mask not loaded")
+            if not has_image and not has_label:
+                tooltip_parts.append("Image and mask not loaded")
+            elif not has_image:
+                tooltip_parts.append("Image not loaded")
+            else:
+                tooltip_parts.append("Mask not loaded")
+        if entry.export_selected:
+            item.setBackground(QBrush(QColor(200, 255, 200)))
+            if has_image and has_label:
+                tooltip_parts.append("Marked for export")
+            else:
+                tooltip_parts.append("Marked for export (incomplete data)")
+        item.setToolTip("\n".join(tooltip_parts))
 
     def _refresh_image_list_styles(self) -> None:
         for idx in range(min(self.image_list.count(), len(self.entries))):
             item = self.image_list.item(idx)
             if item is not None:
                 self._style_image_list_item(item, self.entries[idx])
+
+    def _update_session_status_count(self) -> None:
+        if self.entries:
+            self.dataset_status.setText(f"{len(self.entries)} item(s) in session")
+        else:
+            self.dataset_status.setText("No dataset loaded")
+
+    def _show_image_list_context_menu(self, position: QPoint) -> None:
+        if not self.entries:
+            return
+        index = self.image_list.indexAt(position).row()
+        if index < 0 or index >= len(self.entries):
+            return
+        entry = self.entries[index]
+        menu = QMenu(self)
+        remove_image_action = menu.addAction("Remove Image")
+        remove_label_action = menu.addAction("Remove Label")
+        menu.addSeparator()
+        toggle_export_action = menu.addAction("Mark for Export")
+        toggle_export_action.setCheckable(True)
+        toggle_export_action.setChecked(entry.export_selected)
+        menu.addSeparator()
+        remove_item_action = menu.addAction("Remove Item")
+        remove_image_action.setEnabled(entry.has_image)
+        remove_label_action.setEnabled(entry.has_label)
+        action = menu.exec(self.image_list.mapToGlobal(position))
+        if action == remove_image_action:
+            self._remove_entry_image(index)
+        elif action == remove_label_action:
+            self._remove_entry_label(index)
+        elif action == toggle_export_action:
+            self._toggle_export_selection(index, checked=toggle_export_action.isChecked())
+        elif action == remove_item_action:
+            self._remove_entry_item(index)
+
+    def _remove_entry_image(self, index: int) -> None:
+        if index < 0 or index >= len(self.entries):
+            return
+        entry = self.entries[index]
+        if not entry.has_image:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Remove image?",
+            (
+                f"Remove the image for '{entry.name}' from the session?\n"
+                "The label will remain available."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        entry.image = None
+        entry.image_path = None
+        self._session_dirty = True
+        item = self.image_list.item(index)
+        if item is not None:
+            self._style_image_list_item(item, entry)
+        if self.current_index == index:
+            self._refresh_canvas()
+        self.statusBar().showMessage(f"Removed image for {entry.name}", 4000)
+
+    def _remove_entry_label(self, index: int) -> None:
+        if index < 0 or index >= len(self.entries):
+            return
+        entry = self.entries[index]
+        if not entry.has_label:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Remove label?",
+            (
+                f"Remove the label for '{entry.name}'?\n"
+                "This will discard the original and edited masks."
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        entry.label_path = None
+        entry.original_label = None
+        entry.edited_label = None
+        entry.undo_stack.clear()
+        entry.redo_stack.clear()
+        self._session_dirty = True
+        item = self.image_list.item(index)
+        if item is not None:
+            self._style_image_list_item(item, entry)
+        if self.current_index == index:
+            self._refresh_canvas()
+            self._update_history_view()
+        self.statusBar().showMessage(f"Removed label for {entry.name}", 4000)
+
+    def _remove_entry_item(self, index: int) -> None:
+        if index < 0 or index >= len(self.entries):
+            return
+        entry = self.entries[index]
+        current_row = self.image_list.currentRow()
+        confirm = QMessageBox.question(
+            self,
+            "Remove item?",
+            f"Remove '{entry.name}' from the session?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        self.entries.pop(index)
+        removed = self.image_list.takeItem(index)
+        if removed is not None:
+            del removed
+        self._session_dirty = True
+        if not self.entries:
+            self.set_current_index(-1)
+        else:
+            if index == current_row:
+                next_row = min(index, len(self.entries) - 1)
+                self.image_list.setCurrentRow(next_row)
+            elif current_row >= len(self.entries):
+                self.image_list.setCurrentRow(len(self.entries) - 1)
+        self._update_session_status_count()
+        self._update_history_view()
+        self.statusBar().showMessage(f"Removed item {entry.name}", 4000)
+
+    def _toggle_export_selection(self, index: int, *, checked: bool) -> None:
+        if index < 0 or index >= len(self.entries):
+            return
+        entry = self.entries[index]
+        entry.export_selected = checked
+        self._session_dirty = True
+        item = self.image_list.item(index)
+        if item is not None:
+            self._style_image_list_item(item, entry)
+        status = "Marked" if checked else "Unmarked"
+        self.statusBar().showMessage(f"{status} {entry.name} for export", 2500)
 
     def _ensure_unique_entry_name(self, base_name: str) -> str:
         existing = {entry.name for entry in self.entries}
@@ -457,7 +623,7 @@ class MainWindow(QMainWindow):
         item = QListWidgetItem(entry.name)
         self._style_image_list_item(item, entry)
         self.image_list.addItem(item)
-        self.dataset_status.setText(f"{len(self.entries)} item(s) in session")
+        self._update_session_status_count()
         self._session_dirty = True
         self.set_current_index(len(self.entries) - 1)
         self.statusBar().showMessage(f"Added image {entry.name}", 4000)
@@ -468,13 +634,12 @@ class MainWindow(QMainWindow):
             return
 
         entry = self.entries[self.current_index]
-        start_dir = (
-            str(entry.label_path.parent)
-            if entry.label_path is not None
-            else str(entry.image_path.parent)
-            if entry.image_path.exists()
-            else str(Path.cwd())
-        )
+        if entry.label_path is not None:
+            start_dir = str(entry.label_path.parent)
+        elif entry.image_path is not None and entry.image_path.exists():
+            start_dir = str(entry.image_path.parent)
+        else:
+            start_dir = str(Path.cwd())
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             f"Select mask for {entry.name}",
@@ -490,7 +655,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Mask load failed", f"Could not load mask:\n{exc}")
             return
 
-        if label.shape != entry.image.shape[:2]:
+        if entry.image is not None and label.shape != entry.image.shape[:2]:
             QMessageBox.critical(
                 self,
                 "Size mismatch",
@@ -594,6 +759,9 @@ class MainWindow(QMainWindow):
             self.brush_slider.setValue(value)
         self.canvas.set_brush_radius(value)
 
+    def _handle_polyline_width_changed(self, width: int) -> None:
+        self.polyline_thickness_label.setText(f"Line Thickness: {width} px")
+
     def _handle_tool_changed(self, index: int) -> None:
         data = self.tool_combo.itemData(index)
         mode = data if isinstance(data, ToolMode) else ToolMode.BRUSH
@@ -604,6 +772,7 @@ class MainWindow(QMainWindow):
         is_brush = mode == ToolMode.BRUSH
         self.brush_slider.setEnabled(is_brush)
         self.brush_spin.setEnabled(is_brush)
+        self.polyline_thickness_label.setVisible(mode == ToolMode.POLYLINE)
 
     def _handle_label_view_toggled(self) -> None:
         show_original = self.original_radio.isChecked()
@@ -952,31 +1121,82 @@ class MainWindow(QMainWindow):
 
     def export_labels(self) -> None:
         if not self.entries:
-            QMessageBox.information(self, "Nothing to export", "Load and edit labels first.")
+            QMessageBox.information(self, "Nothing to export", "Load or create entries before exporting.")
             return
         destination = QFileDialog.getExistingDirectory(self, "Select export directory")
         if not destination:
             return
+        selected_entries = [entry for entry in self.entries if entry.export_selected]
+        if not selected_entries:
+            QMessageBox.information(
+                self,
+                "No items selected",
+                "Mark at least one entry for export via the list context menu.",
+            )
+            return
         dest_path = Path(destination)
-        exported = 0
-        skipped: List[str] = []
-        for entry in self.entries:
-            if entry.edited_label is None or entry.label_path is None:
-                skipped.append(entry.name)
-                continue
-            output_path = dest_path / entry.label_path.name
-            try:
-                save_label_image(entry.edited_label, output_path)
-                exported += 1
-            except Exception as exc:  # noqa: BLE001
-                QMessageBox.warning(
-                    self,
-                    "Export warning",
-                    f"Failed to export {entry.name}: {exc}",
+        images_dir = dest_path / "Images"
+        labels_dir = dest_path / "Labels"
+        try:
+            images_dir.mkdir(parents=True, exist_ok=True)
+            labels_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(
+                self,
+                "Export failed",
+                f"Could not prepare export folders:\n{exc}",
+            )
+            return
+
+        exported_images = 0
+        exported_labels = 0
+        skipped_images: List[str] = []
+        skipped_labels: List[str] = []
+        for entry in selected_entries:
+            if entry.image is not None:
+                image_name = entry.image_path.name if entry.image_path else f"{entry.name}.png"
+                image_output = images_dir / image_name
+                try:
+                    save_rgb_image(entry.image, image_output)
+                    exported_images += 1
+                except Exception as exc:  # noqa: BLE001
+                    skipped_images.append(entry.name)
+                    QMessageBox.warning(
+                        self,
+                        "Export warning",
+                        f"Failed to export image for {entry.name}: {exc}",
+                    )
+            else:
+                skipped_images.append(entry.name)
+
+            if entry.edited_label is not None:
+                label_name = (
+                    entry.label_path.name
+                    if entry.label_path is not None and entry.label_path.name
+                    else f"{entry.name}_label.png"
                 )
-        message = f"Exported {exported} label(s) to {dest_path}"
-        if skipped:
-            message += f"; skipped {len(skipped)} without masks"
+                label_output = labels_dir / label_name
+                try:
+                    save_label_image(entry.edited_label, label_output)
+                    exported_labels += 1
+                except Exception as exc:  # noqa: BLE001
+                    skipped_labels.append(entry.name)
+                    QMessageBox.warning(
+                        self,
+                        "Export warning",
+                        f"Failed to export label for {entry.name}: {exc}",
+                    )
+            else:
+                skipped_labels.append(entry.name)
+
+        message = (
+            f"Exported {exported_images} image(s) and {exported_labels} label(s) "
+            f"from {len(selected_entries)} marked item(s) to {dest_path}"
+        )
+        if skipped_images:
+            message += f"; skipped {len(skipped_images)} image(s)"
+        if skipped_labels:
+            message += f"; skipped {len(skipped_labels)} label(s)"
         self.statusBar().showMessage(message, 5000)
 
     # ----- Rendering --------------------------------------------------------
@@ -985,18 +1205,41 @@ class MainWindow(QMainWindow):
             self.canvas.clear()
             return
         entry = self.entries[self.current_index]
-        self.canvas.set_base_image(entry.image)
+        label_source = entry.edited_label if entry.edited_label is not None else entry.original_label
+        base_image = entry.image if entry.has_image else self._placeholder_from_label(label_source)
+        if base_image is None:
+            self.canvas.clear()
+            return
+        self.canvas.set_base_image(base_image)
         self.canvas.set_label_array(entry.edited_label)
         classes = self.class_manager.get_classes()
         overlay_labels = entry.original_label if self._show_original_label else entry.edited_label
         pixmap = self._render_overlay(
-            entry.image,
+            base_image,
             overlay_labels,
             classes,
             self.alpha_slider.value() / 100.0,
         )
         self.canvas.set_pixmap(pixmap)
         self.canvas.viewport().update()
+
+    def _placeholder_from_label(self, label: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if label is None:
+            return None
+        array = np.asarray(label, dtype=np.float32)
+        if array.ndim != 2 or array.size == 0:
+            return None
+        min_val = float(array.min())
+        max_val = float(array.max())
+        if max_val > min_val:
+            normalized = (array - min_val) / (max_val - min_val)
+        elif max_val > 0:
+            normalized = array / max_val
+        else:
+            normalized = np.zeros_like(array, dtype=np.float32)
+        grayscale = np.clip(normalized * 255.0, 0, 255).astype(np.uint8, copy=False)
+        rgb = np.repeat(grayscale[:, :, np.newaxis], 3, axis=2)
+        return np.require(rgb, dtype=np.uint8, requirements=["C"])
 
     def _render_overlay(
         self,

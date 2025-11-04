@@ -96,7 +96,7 @@ class DatasetStore:
         if label_path is not None:
             label_path = Path(label_path)
             new_label = load_label_image(label_path)
-            if entry.image.shape[:2] != new_label.shape:
+            if entry.image is not None and entry.image.shape[:2] != new_label.shape:
                 raise ValueError("Updated label dimensions do not match the image")
             entry.original_label = new_label
             entry.edited_label = new_label.copy()

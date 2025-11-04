@@ -26,14 +26,15 @@ class DatasetEntry:
     """Bundle holding image data, original label, and editable label."""
 
     name: str
-    image_path: Path
+    image_path: Optional[Path]
     label_path: Optional[Path]
-    image: np.ndarray  # RGB uint8
+    image: Optional[np.ndarray]  # RGB uint8
     original_label: Optional[np.ndarray]  # int32
     edited_label: Optional[np.ndarray]  # int32
     metadata: Dict[str, str] = field(default_factory=dict)
     undo_stack: List[EditOperation] = field(default_factory=list, repr=False)
     redo_stack: List[EditOperation] = field(default_factory=list, repr=False)
+    export_selected: bool = False
 
     def reset_edits(self) -> None:
         """Restore edited label to original."""
@@ -45,6 +46,10 @@ class DatasetEntry:
     @property
     def has_label(self) -> bool:
         return self.edited_label is not None
+
+    @property
+    def has_image(self) -> bool:
+        return self.image is not None
 
 
 @dataclass

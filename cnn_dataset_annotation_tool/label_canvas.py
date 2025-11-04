@@ -16,6 +16,7 @@ class ToolMode(Enum):
     LASSO = "lasso"
     MAGNETIC_LASSO = "magnetic_lasso"
     POLYGON = "polygon"
+    POLYLINE = "polyline"
 
 
 class LabelCanvas(QGraphicsView):
@@ -23,6 +24,7 @@ class LabelCanvas(QGraphicsView):
 
     labelEdited = Signal()
     operationPerformed = Signal(object)
+    polylineWidthChanged = Signal(int)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -58,6 +60,7 @@ class LabelCanvas(QGraphicsView):
         self._lasso_start_hover_margin = 2.0
         self._pending_operation_desc: Optional[str] = None
         self._pending_operation_pixels: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        self._polyline_width = 5
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
         self._pixmap_item.setPixmap(pixmap)
@@ -97,6 +100,17 @@ class LabelCanvas(QGraphicsView):
         self._brush_radius = max(1, int(radius))
         self.viewport().update()
 
+    def set_polyline_width(self, width: int) -> None:
+        clamped = max(1, min(200, int(width)))
+        if clamped == self._polyline_width:
+            return
+        self._polyline_width = clamped
+        self.polylineWidthChanged.emit(self._polyline_width)
+        self.viewport().update()
+
+    def polyline_width(self) -> int:
+        return self._polyline_width
+
     def set_paint_values(self, source_value: Optional[int], target_value: Optional[int]) -> None:
         self._source_value = source_value
         self._target_value = target_value
@@ -107,6 +121,8 @@ class LabelCanvas(QGraphicsView):
         self._tool_mode = mode
         self._cancel_lasso()
         self._hover_pos = None
+        if self._tool_mode == ToolMode.POLYLINE:
+            self.polylineWidthChanged.emit(self._polyline_width)
         self.viewport().update()
 
     def _format_value(self, value: Optional[int]) -> str:
@@ -119,6 +135,8 @@ class LabelCanvas(QGraphicsView):
             return "Magnetic Lasso"
         if self._tool_mode == ToolMode.POLYGON:
             return "Polygon"
+        if self._tool_mode == ToolMode.POLYLINE:
+            return "Polygon Line"
         return "Brush"
 
     def _begin_operation(self, description: str) -> None:
@@ -168,12 +186,35 @@ class LabelCanvas(QGraphicsView):
         self._pending_operation_desc = None
         self._pending_operation_pixels = {}
 
+    def _lasso_finalize_point(self) -> Optional[QPointF]:
+        if not self._lasso_points:
+            return None
+        if self._tool_mode == ToolMode.POLYLINE:
+            return self._lasso_points[-1]
+        return self._lasso_points[0]
+
+    def _adjust_polyline_width(self, delta: int) -> None:
+        if delta == 0:
+            return
+        self.set_polyline_width(self._polyline_width + delta)
+
     def wheelEvent(self, event) -> None:  # type: ignore[override]
+        if self._tool_mode == ToolMode.POLYLINE and self._lasso_active and self._lasso_points:
+            delta = event.angleDelta().y()
+            if delta == 0:
+                delta = event.angleDelta().x()
+            steps = delta // 120 if delta else 0
+            if steps == 0 and delta:
+                steps = 1 if delta > 0 else -1
+            if steps:
+                self._adjust_polyline_width(int(steps))
+            event.accept()
+            return
         if event.modifiers() & Qt.ControlModifier:
             factor = 1.25 if event.angleDelta().y() > 0 else 0.8
             self.scale(factor, factor)
-        else:
-            super().wheelEvent(event)
+            return
+        super().wheelEvent(event)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if self._tool_mode == ToolMode.BRUSH:
@@ -209,6 +250,9 @@ class LabelCanvas(QGraphicsView):
                 return
         elif self._tool_mode == ToolMode.POLYGON:
             if self._handle_polygon_press(event):
+                return
+        elif self._tool_mode == ToolMode.POLYLINE:
+            if self._handle_polyline_press(event):
                 return
         else:
             scene_pos = self.mapToScene(event.position().toPoint())
@@ -320,6 +364,72 @@ class LabelCanvas(QGraphicsView):
             return True
         return False
 
+    def _handle_polyline_press(self, event) -> bool:
+        if event.button() == Qt.MiddleButton:
+            return False
+        scene_pos = self.mapToScene(event.position().toPoint())
+        if event.button() == Qt.LeftButton:
+            if self._label_array is None or self._target_value is None:
+                event.accept()
+                return True
+            if not self._within_image(scene_pos):
+                event.accept()
+                return True
+            if not self._lasso_active:
+                self._begin_lasso(scene_pos)
+                event.accept()
+                return True
+            if self._is_near_lasso_start(scene_pos) and len(self._lasso_points) >= 2:
+                self._active_source = self._source_value
+                self._active_target = self._target_value
+                source_value = self._active_source
+                target_value = self._active_target
+                result = self._finish_lasso()
+                if result is not None and target_value is not None:
+                    coords, previous_values, new_values = result
+                    description = (
+                        f"{self._operation_base_name()} "
+                        f"{self._format_value(source_value)}→{self._format_value(target_value)}"
+                    )
+                    self.labelEdited.emit()
+                    self._emit_operation_from_arrays(description, coords, previous_values, new_values)
+                event.accept()
+                return True
+            self._append_lasso_point(scene_pos)
+            self.viewport().update()
+            event.accept()
+            return True
+        if event.button() == Qt.RightButton:
+            if not self._lasso_active:
+                event.accept()
+                return True
+            if self._is_near_lasso_start(scene_pos) and len(self._lasso_points) >= 2:
+                if self._source_value is None or self._target_value is None:
+                    self._cancel_lasso()
+                    self.viewport().update()
+                    event.accept()
+                    return True
+                self._active_source = self._target_value
+                self._active_target = self._source_value
+                source_value = self._active_source
+                target_value = self._active_target
+                result = self._finish_lasso()
+                if result is not None and target_value is not None:
+                    coords, previous_values, new_values = result
+                    description = (
+                        f"{self._operation_base_name()} "
+                        f"{self._format_value(source_value)}→{self._format_value(target_value)} (reverse)"
+                    )
+                    self.labelEdited.emit()
+                    self._emit_operation_from_arrays(description, coords, previous_values, new_values)
+                event.accept()
+                return True
+            self._cancel_lasso()
+            self.viewport().update()
+            event.accept()
+            return True
+        return False
+
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         scene_pos = self.mapToScene(event.position().toPoint())
         self._hover_pos = scene_pos if self._within_image(scene_pos) else None
@@ -379,27 +489,63 @@ class LabelCanvas(QGraphicsView):
             return
         inv_transform = self.transform().inverted()[0]
         unit = inv_transform.mapRect(QRectF(0, 0, 1, 1)).width()
-        if self._tool_mode in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO, ToolMode.POLYGON) and self._lasso_points:
+        if (
+            self._tool_mode
+            in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO, ToolMode.POLYGON, ToolMode.POLYLINE)
+            and self._lasso_points
+        ):
             painter.save()
-            path = QPolygonF(self._lasso_points)
-            pen = QPen(QColor(255, 255, 255, 200), max(1.0, unit))
-            painter.setPen(pen)
-            painter.setBrush(QColor(255, 255, 255, 40) if self._lasso_active else Qt.NoBrush)
-            painter.drawPolygon(path)
-            if self._tool_mode == ToolMode.POLYGON and self._lasso_active and self._hover_pos is not None:
-                preview_pen = QPen(QColor(200, 200, 200, 160), max(1.0, unit), Qt.DashLine)
-                painter.setPen(preview_pen)
-                painter.drawLine(self._lasso_points[-1], self._hover_pos)
+            polyline_pen_width: Optional[float] = None
+            if self._tool_mode == ToolMode.POLYLINE:
+                pen_width = max(unit, self._polyline_width * unit)
+                polyline_pen_width = pen_width
+                stroke_pen = QPen(
+                    QColor(255, 255, 255, 200),
+                    pen_width,
+                    Qt.SolidLine,
+                    Qt.RoundCap,
+                    Qt.RoundJoin,
+                )
+                painter.setPen(stroke_pen)
+                painter.setBrush(Qt.NoBrush)
+                if len(self._lasso_points) == 1:
+                    radius = max(pen_width * 0.5, unit)
+                    painter.drawEllipse(self._lasso_points[0], radius, radius)
+                else:
+                    painter.drawPolyline(QPolygonF(self._lasso_points))
+                if self._lasso_active and self._hover_pos is not None:
+                    preview_pen = QPen(
+                        QColor(200, 200, 200, 160),
+                        pen_width,
+                        Qt.DashLine,
+                        Qt.RoundCap,
+                        Qt.RoundJoin,
+                    )
+                    painter.setPen(preview_pen)
+                    painter.drawLine(self._lasso_points[-1], self._hover_pos)
+            else:
+                path = QPolygonF(self._lasso_points)
+                pen = QPen(QColor(255, 255, 255, 200), max(1.0, unit))
+                painter.setPen(pen)
+                painter.setBrush(QColor(255, 255, 255, 40) if self._lasso_active else Qt.NoBrush)
+                painter.drawPolygon(path)
+                if self._tool_mode == ToolMode.POLYGON and self._lasso_active and self._hover_pos is not None:
+                    preview_pen = QPen(QColor(200, 200, 200, 160), max(1.0, unit), Qt.DashLine)
+                    painter.setPen(preview_pen)
+                    painter.drawLine(self._lasso_points[-1], self._hover_pos)
             if self._lasso_active:
-                start_point = self._lasso_points[0]
-                start_radius = max(self._lasso_start_screen_radius * unit, 3.0 * unit)
-                hover_color = QColor(160, 160, 160, 230)
-                base_color = QColor(255, 255, 255, 230)
-                marker_color = hover_color if self._lasso_start_hover else base_color
-                marker_pen = QPen(QColor(30, 30, 30, 220), max(1.0, unit))
-                painter.setPen(marker_pen)
-                painter.setBrush(marker_color)
-                painter.drawEllipse(start_point, start_radius, start_radius)
+                finalize_point = self._lasso_finalize_point()
+                if finalize_point is not None:
+                    start_radius = max(self._lasso_start_screen_radius * unit, 3.0 * unit)
+                    if polyline_pen_width is not None:
+                        start_radius = max(start_radius, polyline_pen_width * 0.6)
+                    hover_color = QColor(160, 160, 160, 230)
+                    base_color = QColor(255, 255, 255, 230)
+                    marker_color = hover_color if self._lasso_start_hover else base_color
+                    marker_pen = QPen(QColor(30, 30, 30, 220), max(1.0, unit))
+                    painter.setPen(marker_pen)
+                    painter.setBrush(marker_color)
+                    painter.drawEllipse(finalize_point, start_radius, start_radius)
             painter.restore()
         if self._tool_mode == ToolMode.BRUSH and self._hover_pos is not None and self._brush_radius > 0:
             painter.save()
@@ -464,14 +610,23 @@ class LabelCanvas(QGraphicsView):
         ):
             self._cancel_lasso()
             return None
-        if len(self._lasso_points) < 3:
+        min_points = 2 if self._tool_mode == ToolMode.POLYLINE else 3
+        if len(self._lasso_points) < min_points:
             self._cancel_lasso()
             return None
-        result = self._apply_polygon(
-            self._lasso_points,
-            self._active_source,
-            self._active_target,
-        )
+        if self._tool_mode == ToolMode.POLYLINE:
+            result = self._apply_polyline(
+                self._lasso_points,
+                self._polyline_width,
+                self._active_source,
+                self._active_target,
+            )
+        else:
+            result = self._apply_polygon(
+                self._lasso_points,
+                self._active_source,
+                self._active_target,
+            )
         self._cancel_lasso()
         self.viewport().update()
         return result
@@ -486,33 +641,40 @@ class LabelCanvas(QGraphicsView):
     def _lasso_hover_radius_scene(self) -> float:
         unit = self._scene_unit()
         base_radius = (self._lasso_start_screen_radius + self._lasso_start_hover_margin) * unit
+        if self._tool_mode == ToolMode.POLYLINE:
+            base_radius = max(base_radius, (self._polyline_width * 0.6 + self._lasso_start_hover_margin) * unit)
         return max(base_radius, 3.0 * unit)
 
     def _is_near_lasso_start(self, point: QPointF) -> bool:
         if (
             self._tool_mode
-            not in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO, ToolMode.POLYGON)
+            not in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO, ToolMode.POLYGON, ToolMode.POLYLINE)
             or not self._lasso_points
         ):
             return False
-        start = self._lasso_points[0]
+        finalize_point = self._lasso_finalize_point()
+        if finalize_point is None:
+            return False
         radius = self._lasso_hover_radius_scene()
-        dx = point.x() - start.x()
-        dy = point.y() - start.y()
+        dx = point.x() - finalize_point.x()
+        dy = point.y() - finalize_point.y()
         return dx * dx + dy * dy <= radius * radius
 
     def _update_lasso_start_hover(self) -> None:
         hovering = False
         if (
-            self._tool_mode in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO, ToolMode.POLYGON)
+            self._tool_mode
+            in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO, ToolMode.POLYGON, ToolMode.POLYLINE)
             and self._lasso_points
             and self._hover_pos is not None
         ):
-            start = self._lasso_points[0]
-            radius = self._lasso_hover_radius_scene()
-            dx = self._hover_pos.x() - start.x()
-            dy = self._hover_pos.y() - start.y()
-            hovering = dx * dx + dy * dy <= radius * radius
+            finalize_point = self._lasso_finalize_point()
+            if finalize_point is not None:
+                start = finalize_point
+                radius = self._lasso_hover_radius_scene()
+                dx = self._hover_pos.x() - start.x()
+                dy = self._hover_pos.y() - start.y()
+                hovering = dx * dx + dy * dy <= radius * radius
         if hovering != self._lasso_start_hover:
             self._lasso_start_hover = hovering
             self.viewport().update()
@@ -534,6 +696,49 @@ class LabelCanvas(QGraphicsView):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(255, 255, 255, 255))
         painter.drawPolygon(QPolygonF(points))
+        painter.end()
+        ptr = mask_image.bits()
+        total_bytes = mask_image.height() * mask_image.bytesPerLine()
+        if hasattr(ptr, "setsize"):
+            ptr.setsize(total_bytes)
+            buffer = np.frombuffer(ptr, dtype=np.uint8)
+        else:
+            buffer = np.frombuffer(ptr, dtype=np.uint8, count=total_bytes)
+        mask_buffer = buffer.reshape(mask_image.height(), mask_image.bytesPerLine())
+        mask = mask_buffer[:, :width] > 0
+        if source_value is not None:
+            selection = np.logical_and(mask, self._label_array == source_value)
+        else:
+            selection = mask
+        if not np.any(selection):
+            return None
+        different = np.logical_and(selection, self._label_array != target_value)
+        if not np.any(different):
+            return None
+        coords = np.argwhere(different)
+        previous_values = self._label_array[different].astype(np.int32, copy=True)
+        self._label_array[different] = target_value
+        new_values = np.full(previous_values.shape, int(target_value), dtype=np.int32)
+        return coords, previous_values, new_values
+
+    def _apply_polyline(
+        self,
+        points: List[QPointF],
+        thickness: int,
+        source_value: Optional[int],
+        target_value: Optional[int],
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        if self._label_array is None or target_value is None or len(points) < 2:
+            return None
+        height, width = self._label_array.shape
+        if width == 0 or height == 0:
+            return None
+        mask_image = QImage(width, height, QImage.Format_Grayscale8)
+        mask_image.fill(0)
+        painter = QPainter(mask_image)
+        pen = QPen(QColor(255, 255, 255, 255), float(max(1, thickness)), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPolyline(QPolygonF(points))
         painter.end()
         ptr = mask_image.bits()
         total_bytes = mask_image.height() * mask_image.bytesPerLine()
