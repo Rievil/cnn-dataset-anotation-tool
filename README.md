@@ -1,73 +1,65 @@
 # CNN Dataset Annotation Tool
 
 ## Overview
-The CNN Dataset Annotation Tool is a desktop application built with PySide that streamlines the review and correction of pixel-wise labels for convolutional neural network (CNN) datasets. The tool loads paired images and label masks, lets you visualize segmentation results with customizable overlays, and offers intuitive editing utilities to repair mislabeled pixels before exporting an updated label set.
+The CNN Dataset Annotation Tool is a PySide6 desktop application for reviewing and repairing pixel-wise segmentation results. It loads paired images and label masks, overlays color-coded classes, and gives you interactive tools to correct mistakes before exporting a cleaned dataset.
 
-## Key Features
-- **Dataset Loader** – Select separate folders for source images and their corresponding label masks. The tool handles dataset initialization and maintains the link between each image-label pair.
-- **Class Management** – Define the semantic classes present in the dataset, assign the integer pixel value each class represents (for example `0 = background`, `1 = matrix`, `2 = crack`, `3 = pore`), and configure per-class display colors.
-- **Label Visualization** – Display images with an adjustable overlay of their labels using a Jet colormap. Control the alpha value to fine-tune the transparency of the mask and make label discrepancies easy to spot.
-- **Interactive Editing** – Pick a source class (e.g., `pore`) and a target class (e.g., `matrix`) to repaint false positives. Editing is applied with a brush whose size and shape are visualized in real time, ensuring precise corrections.
-- **Navigation Tools** – Zoom in/out to inspect details, reposition the cursor accurately, and pan across the canvas by holding the middle mouse button.
-- **Revision Control** – Every label mask is duplicated before edits begin so that you can revert to the original state at any time. When edits are complete, export the modified masks as a new label set without overwriting the originals.
+## Project Status
+Since the last README update the project has moved from specification to a working annotator. Highlights:
 
-## Typical Workflow
-1. **Launch the application** and choose the directories that contain your images and the associated labels.
-2. **Configure class mappings** by entering each class name, its pixel value, and the desired display color.
-3. **Tune the visualization** by adjusting the overlay alpha until the areas needing attention stand out.
-4. **Select a repaint operation** by picking the source class you want to correct and the target class you want those pixels to become.
-5. **Use the brush tool** to apply corrections, leveraging zoom and pan to work on fine details. The on-screen brush preview helps confirm the brush footprint before committing changes.
-6. **Review and revert if needed** using the preserved originals to undo accidental edits.
-7. **Export the edited labels** to generate a clean set of masks ready for downstream training or evaluation workflows.
+- **Implemented** – Load sessions from paired folders or parquet files (with class definitions), edit masks with brush/lasso/polygon/polyline tools, undo or redo every change with a per-item history view, mark items for export and batch-write images plus labels, and manage the same parquet datasets through the shared CLI.
+- **In progress** – The dataset description tab is UI-only; saving those key/value notes back into parquet is still pending. Editing per-entry metadata from the GUI and adding richer QA helpers remain on the roadmap.
 
-## Getting Started
+## Desktop Application
+
+### Getting Started
 1. Create and activate a Python 3.10+ virtual environment.
 2. Install dependencies with `pip install -r requirements.txt`.
-3. Run the tool with `python main.py`.
+3. Launch the GUI via `python main.py`.
 
-The included `datasets/images` and `datasets/labels` folders contain a tiny sample pair you can use for a smoke test.
+A smoke-test pair lives in `datasets/images` and `datasets/labels`.
+
+### Key Capabilities
+- Load datasets from folders (auto-matching common filenames) or resume saved parquet sessions, with clear feedback when pairs are skipped.
+- Append standalone images with `Add Image` and attach masks later through `Load Mask`.
+- Maintain class definitions: rename classes, reassign pixel values, pick colors, or auto-detect values from the current labels.
+- Toggle between edited and original labels, adjust overlay alpha, and hide or show the controls column to maximise canvas space.
+- Choose among multiple editing modes: brush, freehand lasso, magnetic lasso, polygon fill, and variable-width polygon line strokes. Left click applies source→target, right click swaps direction.
+- Track every modification with undo/redo shortcuts, inspect the history tab, and revert an item back to its original mask.
+- Mark items for export from the list context menu, then export selected images and labels into organised `Images/` and `Labels/` directories.
+- Save all work—including images, masks, class definitions, and per-entry metadata—to parquet for later resumption or CLI automation.
+
+### Typical Workflow
+1. Click `Load Dataset` and choose between a parquet session or paired folders.
+2. Use `Add Image` / `Load Mask` to fill in missing pairs if needed.
+3. Auto-detect classes or configure them manually, then review overlay alpha and source/target selections.
+4. Pick an editing tool; left click applies the configured direction, right click reverses it.
+5. Zoom with `Ctrl` + mouse wheel, pan with the middle mouse button, and use undo/redo as you refine the mask.
+6. Toggle between edited and original labels or reset the current item when you need a clean slate.
+7. Mark finished items for export via the list context menu.
+8. Save the session to parquet or run `Export Images & Labels` to write the marked items to disk.
+
+### Editing Tool Tips
+- Freehand and polygon lassos close when you return to the start point; right click cancels the trace.
+- Magnetic lasso follows image gradients—well-defined edges produce the best results.
+- Polygon line thickness adjusts with the mouse wheel while tracing; the current value appears beside the tool controls.
 
 ## Command Line Dataset Management
-Install the dependencies and run the CLI to work with parquet datasets:
+The CLI shares the same `DatasetStore` as the GUI. Install dependencies, then manage parquet datasets from the terminal:
 
 ```
 python -m cnn_dataset_annotation_tool.cli --dataset work.parquet list
 ```
 
 Available subcommands:
-- `list` – show every entry with its image, label, and metadata.
-- `add NAME IMAGE LABEL [-m KEY=VALUE ...] [--overwrite]` – append a new item (optionally replacing an existing one).
+- `list` – display every entry with its image, label, and metadata.
+- `add NAME IMAGE LABEL [-m KEY=VALUE ...] [--overwrite]` – append a new item (or replace an existing one).
 - `remove NAME` – delete an entry.
-- `update NAME [--image IMAGE] [--label LABEL] [-m KEY=VALUE ...] [--replace-metadata|--clear-metadata]` – modify data or metadata.
+- `update NAME [--image IMAGE] [--label LABEL] [-m KEY=VALUE ...] [--replace-metadata|--clear-metadata]` – modify assets or metadata in place.
 
-Metadata is stored as JSON key-value pairs. Provide `-m key=value` multiple times to set or update fields.
+## Sample Data
+`work.parquet` demonstrates the saved-session format, and the `datasets/images` plus `datasets/labels` folders supply a minimal pair for quick validation.
 
-## Programmatic Usage
-Use the `DatasetStore` helper for Python workflows:
-
-```python
-from pathlib import Path
-from cnn_dataset_annotation_tool import DatasetStore
-
-store = DatasetStore.load(Path("work.parquet"))
-store.add_entry(
-    name="sample",
-    image_path=Path("datasets/images/sample.png"),
-    label_path=Path("datasets/labels/sample.png"),
-    metadata={"split": "train", "notes": "new capture"},
-)
-store.save()
-
-for entry in store.list_entries():
-    print(entry.name, entry.metadata)
-```
-
-## Current Implementation Highlights
-- Load image and label folders independently; matching filenames are paired automatically.
-- Auto-detect classes from loaded label masks, with controls to rename, reassign values, and choose display colors.
-- Adjustable overlay alpha for inspecting the segmentation mask on top of the source image.
-- Circular brush with configurable size and live preview for repainting pixels from a chosen source class to a target class.
-- Zoom with the mouse wheel (hold `Ctrl`), pan with the middle mouse button, and revert label edits at any time.
-- Export edited masks to a user-selected directory without modifying the originals.
-
-Contributions and feedback are welcome as the tool evolves from this specification into a full annotation workflow.
+## Roadmap
+- Persist the dataset description tab into saved parquet files.
+- Surface per-entry metadata editing inside the GUI.
+- Add automated QA helpers and additional shortcuts as the workflow evolves.
