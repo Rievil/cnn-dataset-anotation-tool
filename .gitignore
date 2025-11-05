@@ -5,6 +5,9 @@ __pycache__/
 *.parquet
 # C extensions
 *.so
+.venv-build
+dist/cnn-dataset-annotation-tool.exe
+dist/*
 
 # Distribution / packaging
 .Python

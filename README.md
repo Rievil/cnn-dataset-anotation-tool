@@ -18,6 +18,13 @@ Since the last README update the project has moved from specification to a worki
 
 A smoke-test pair lives in `datasets/images` and `datasets/labels`.
 
+### Windows Standalone Build
+- On a Windows machine with Python 3.9+ installed, open PowerShell and run `powershell -ExecutionPolicy Bypass -File build_windows_exe.ps1` from the repository root.
+- The script creates a local `.venv-build`, installs PyInstaller plus the app requirements, and emits `dist/cnn-dataset-annotation-tool.exe`.
+- The packaged build includes the `cnn_dataset_annotation_tool` package and, when present, the demo `datasets` directory for quick validation.
+- Re-run the script any time the code changes; existing dependencies are reused to keep builds fast.
+- Delete the `.venv-build` folder if you need to force a clean environment on the next build.
+
 ### Key Capabilities
 - Load datasets from folders (auto-matching common filenames) or resume saved parquet sessions, with clear feedback when pairs are skipped.
 - Append standalone images with `Add Image` and attach masks later through `Load Mask`.
