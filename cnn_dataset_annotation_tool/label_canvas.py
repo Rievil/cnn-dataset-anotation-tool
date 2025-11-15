@@ -25,6 +25,7 @@ class LabelCanvas(QGraphicsView):
     labelEdited = Signal()
     operationPerformed = Signal(object)
     polylineWidthChanged = Signal(int)
+    brushRadiusChanged = Signal(int)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -61,6 +62,10 @@ class LabelCanvas(QGraphicsView):
         self._pending_operation_desc: Optional[str] = None
         self._pending_operation_pixels: Dict[Tuple[int, int], Tuple[int, int]] = {}
         self._polyline_width = 5
+        self._brush_preview_mask: Optional[np.ndarray] = None
+        self._brush_preview_image: Optional[QImage] = None
+        self._brush_preview_dirty = False
+        self._brush_preview_color = QColor(255, 255, 255, 160)
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
         self._pixmap_item.setPixmap(pixmap)
@@ -73,6 +78,7 @@ class LabelCanvas(QGraphicsView):
         self._pixmap_item.setPixmap(QPixmap())
         self._scene.setSceneRect(QRectF())
         self._label_array = None
+        self._clear_brush_preview()
         self._image_size = (0, 0)
         self._base_image = None
         self._gradient_map = None
@@ -81,6 +87,7 @@ class LabelCanvas(QGraphicsView):
 
     def set_label_array(self, array: Optional[np.ndarray]) -> None:
         self._label_array = array
+        self._clear_brush_preview()
 
     def set_base_image(self, image: Optional[np.ndarray]) -> None:
         if image is None:
@@ -97,7 +104,11 @@ class LabelCanvas(QGraphicsView):
         self._gradient_map = np.hypot(gx, gy)
 
     def set_brush_radius(self, radius: int) -> None:
-        self._brush_radius = max(1, int(radius))
+        clamped = max(1, min(200, int(radius)))
+        if clamped == self._brush_radius:
+            return
+        self._brush_radius = clamped
+        self.brushRadiusChanged.emit(self._brush_radius)
         self.viewport().update()
 
     def set_polyline_width(self, width: int) -> None:
@@ -121,6 +132,7 @@ class LabelCanvas(QGraphicsView):
         self._tool_mode = mode
         self._cancel_lasso()
         self._hover_pos = None
+        self._clear_brush_preview()
         if self._tool_mode == ToolMode.POLYLINE:
             self.polylineWidthChanged.emit(self._polyline_width)
         self.viewport().update()
@@ -193,19 +205,112 @@ class LabelCanvas(QGraphicsView):
             return self._lasso_points[-1]
         return self._lasso_points[0]
 
+    def _wheel_steps(self, event) -> int:
+        delta = event.angleDelta().y()
+        if delta == 0:
+            delta = event.angleDelta().x()
+        steps = delta // 120 if delta else 0
+        if steps == 0 and delta:
+            steps = 1 if delta > 0 else -1
+        return int(steps)
+
     def _adjust_polyline_width(self, delta: int) -> None:
         if delta == 0:
             return
         self.set_polyline_width(self._polyline_width + delta)
 
+    def _adjust_brush_radius(self, delta: int) -> None:
+        if delta == 0:
+            return
+        self.set_brush_radius(self._brush_radius + delta)
+
+    def _initialize_brush_preview(self, reverse: bool) -> None:
+        if self._label_array is None:
+            self._clear_brush_preview()
+            return
+        self._brush_preview_mask = np.zeros(self._label_array.shape, dtype=bool)
+        self._brush_preview_image = None
+        self._brush_preview_dirty = False
+        self._brush_preview_color = QColor(255, 140, 0, 160) if reverse else QColor(255, 255, 255, 160)
+
+    def _clear_brush_preview(self) -> None:
+        self._brush_preview_mask = None
+        self._brush_preview_image = None
+        self._brush_preview_dirty = False
+
+    def _mark_brush_preview_pixel(self, row: int, col: int) -> None:
+        if self._brush_preview_mask is None:
+            return
+        if (
+            row < 0
+            or col < 0
+            or row >= self._brush_preview_mask.shape[0]
+            or col >= self._brush_preview_mask.shape[1]
+        ):
+            return
+        self._brush_preview_mask[row, col] = True
+        self._brush_preview_dirty = True
+
+    def _current_brush_preview_image(self) -> Optional[QImage]:
+        if self._brush_preview_mask is None or not np.any(self._brush_preview_mask):
+            return None
+        if self._brush_preview_image is None or self._brush_preview_dirty:
+            self._rebuild_brush_preview_image()
+        return self._brush_preview_image
+
+    def _rebuild_brush_preview_image(self) -> None:
+        if (
+            self._brush_preview_mask is None
+            or self._label_array is None
+            or not np.any(self._brush_preview_mask)
+        ):
+            self._brush_preview_image = None
+            self._brush_preview_dirty = False
+            return
+        mask = self._brush_preview_mask
+        height, width = mask.shape
+        image = QImage(width, height, QImage.Format_ARGB32)
+        image.fill(0)
+        ptr = image.bits()
+        total_bytes = image.sizeInBytes()
+        if hasattr(ptr, "setsize"):
+            ptr.setsize(total_bytes)
+        buffer = np.frombuffer(ptr, dtype=np.uint8, count=total_bytes)
+        array = buffer.reshape((height, image.bytesPerLine()))
+        rgba = array[:, : width * 4].reshape((height, width, 4))
+        color = self._brush_preview_color if self._brush_preview_color is not None else QColor(255, 255, 255, 160)
+        rgba[..., 0][mask] = color.blue()
+        rgba[..., 1][mask] = color.green()
+        rgba[..., 2][mask] = color.red()
+        rgba[..., 3][mask] = color.alpha()
+        self._brush_preview_image = image
+        self._brush_preview_dirty = False
+
+    def _commit_pending_brush_changes(self) -> bool:
+        if self._label_array is None or not self._pending_operation_pixels:
+            return False
+        ordered = list(self._pending_operation_pixels.items())
+        if not ordered:
+            return False
+        coords = np.array([coord for coord, _ in ordered], dtype=np.int32)
+        rows = coords[:, 0]
+        cols = coords[:, 1]
+        new_values = np.asarray(
+            [values[1] for _, values in ordered],
+            dtype=self._label_array.dtype,
+        )
+        self._label_array[rows, cols] = new_values
+        return True
+
     def wheelEvent(self, event) -> None:  # type: ignore[override]
+        if self._tool_mode == ToolMode.BRUSH and not (event.modifiers() & Qt.ControlModifier):
+            steps = self._wheel_steps(event)
+            if steps:
+                self._adjust_brush_radius(int(steps))
+                event.accept()
+                return
         if self._tool_mode == ToolMode.POLYLINE and self._lasso_active and self._lasso_points:
-            delta = event.angleDelta().y()
-            if delta == 0:
-                delta = event.angleDelta().x()
-            steps = delta // 120 if delta else 0
-            if steps == 0 and delta:
-                steps = 1 if delta > 0 else -1
+            steps = self._wheel_steps(event)
             if steps:
                 self._adjust_polyline_width(int(steps))
             event.accept()
@@ -221,7 +326,8 @@ class LabelCanvas(QGraphicsView):
             if event.button() in (Qt.LeftButton, Qt.RightButton):
                 if self._label_array is None:
                     return
-                if event.button() == Qt.LeftButton:
+                reverse = event.button() == Qt.RightButton
+                if not reverse:
                     active_source = self._source_value
                     active_target = self._target_value
                 else:
@@ -234,13 +340,14 @@ class LabelCanvas(QGraphicsView):
                 scene_pos = self.mapToScene(event.position().toPoint())
                 if not self._within_image(scene_pos):
                     return
+                self._initialize_brush_preview(reverse)
                 description = (
                     f"Brush {self._format_value(active_source)}→{self._format_value(active_target)}"
                 )
                 self._begin_operation(description)
                 changed = self._apply_brush(scene_pos, active_source, active_target)
                 if changed:
-                    self.labelEdited.emit()
+                    self.viewport().update()
                 self._painting = True
                 self._active_source = active_source
                 self._active_target = active_target
@@ -436,14 +543,12 @@ class LabelCanvas(QGraphicsView):
         if self._tool_mode == ToolMode.BRUSH:
             if self._painting and self._label_array is not None and self._active_target is not None:
                 if self._last_paint_point is not None:
-                    changed = self._apply_brush_line(
+                    self._apply_brush_line(
                         self._last_paint_point,
                         scene_pos,
                         self._active_source,
                         self._active_target,
                     )
-                    if changed:
-                        self.labelEdited.emit()
                 self._last_paint_point = scene_pos
         elif (
             self._tool_mode in (ToolMode.LASSO, ToolMode.MAGNETIC_LASSO)
@@ -459,12 +564,17 @@ class LabelCanvas(QGraphicsView):
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if self._tool_mode == ToolMode.BRUSH:
             if event.button() in (Qt.LeftButton, Qt.RightButton):
+                committed = self._commit_pending_brush_changes()
                 self._emit_operation_from_pending()
+                if committed:
+                    self.labelEdited.emit()
                 self._painting = False
                 self._painting_button = None
                 self._active_source = None
                 self._active_target = None
                 self._last_paint_point = None
+                self._clear_brush_preview()
+                self.viewport().update()
                 event.accept()
                 return
         else:
@@ -547,6 +657,12 @@ class LabelCanvas(QGraphicsView):
                     painter.setBrush(marker_color)
                     painter.drawEllipse(finalize_point, start_radius, start_radius)
             painter.restore()
+        if self._tool_mode == ToolMode.BRUSH:
+            preview_image = self._current_brush_preview_image()
+            if preview_image is not None:
+                painter.save()
+                painter.drawImage(QPointF(0, 0), preview_image)
+                painter.restore()
         if self._tool_mode == ToolMode.BRUSH and self._hover_pos is not None and self._brush_radius > 0:
             painter.save()
             radius = self._brush_radius
@@ -828,7 +944,7 @@ class LabelCanvas(QGraphicsView):
                     continue
                 if current_value == target_value:
                     continue
-                self._label_array[y, x] = target_value
                 self._record_pixel_change(y, x, current_value, int(target_value))
+                self._mark_brush_preview_pixel(y, x)
                 changed = True
         return changed

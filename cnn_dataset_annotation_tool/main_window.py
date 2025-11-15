@@ -289,6 +289,7 @@ class MainWindow(QMainWindow):
         self.canvas.labelEdited.connect(self._handle_label_edited)
         self.canvas.operationPerformed.connect(self._record_operation)
         self.canvas.polylineWidthChanged.connect(self._handle_polyline_width_changed)
+        self.canvas.brushRadiusChanged.connect(self._handle_canvas_brush_radius_changed)
         self.class_manager.classesChanged.connect(self._handle_classes_changed)
         self.class_manager.autoPopulateRequested.connect(self._auto_populate_classes)
         self.edited_radio.toggled.connect(self._handle_label_view_toggled)
@@ -758,6 +759,12 @@ class MainWindow(QMainWindow):
         if self.brush_slider.value() != value:
             self.brush_slider.setValue(value)
         self.canvas.set_brush_radius(value)
+
+    def _handle_canvas_brush_radius_changed(self, radius: int) -> None:
+        if self.brush_slider.value() != radius:
+            self.brush_slider.setValue(radius)
+        if self.brush_spin.value() != radius:
+            self.brush_spin.setValue(radius)
 
     def _handle_polyline_width_changed(self, width: int) -> None:
         self.polyline_thickness_label.setText(f"Line Thickness: {width} px")
