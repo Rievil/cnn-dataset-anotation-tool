@@ -9,6 +9,9 @@ Since the last README update the project has moved from specification to a worki
 - **Implemented** – Load sessions from paired folders or parquet files (with class definitions), edit masks with brush/lasso/polygon/polyline tools, undo or redo every change with a per-item history view, mark items for export and batch-write images plus labels, and manage the same parquet datasets through the shared CLI.
 - **In progress** – The dataset description tab is UI-only; saving those key/value notes back into parquet is still pending. Editing per-entry metadata from the GUI and adding richer QA helpers remain on the roadmap.
 
+## Documentation
+- [Application Design & Workflow](docs/app_design.md) – high-level UI layout, tool behavior (including the “finalizing dot” interactions), recoloring guidance, export modes, and CLI automation tips with embedded script examples.
+
 ## Desktop Application
 
 ### Getting Started
@@ -65,6 +68,9 @@ Available subcommands:
 
 ## Sample Data
 `work.parquet` demonstrates the saved-session format, and the `datasets/images` plus `datasets/labels` folders supply a minimal pair for quick validation.
+
+## Assets
+- Placeholder application icons live in `resources/app_icon.png` and `resources/app_icon.ico`. Replace them with branded artwork before distributing installers.
 
 ## Roadmap
 - Persist the dataset description tab into saved parquet files.

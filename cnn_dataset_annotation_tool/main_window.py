@@ -1,20 +1,38 @@
 from __future__ import annotations
 
+import subprocess
 import sys
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QColor, QImage, QKeySequence, QPixmap, QPalette, QShortcut, QBrush
+from PySide6.QtCore import QObject, QPoint, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QImage,
+    QKeySequence,
+    QPixmap,
+    QPalette,
+    QShortcut,
+    QBrush,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QButtonGroup,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMenu,
@@ -33,6 +51,7 @@ from PySide6.QtWidgets import (
     QComboBox,
 )
 
+from .about_dialog import AboutDialog
 from .class_manager import ClassManagerWidget
 from .constants import fallback_color
 from .io_utils import (
@@ -46,6 +65,19 @@ from .io_utils import (
 )
 from .label_canvas import LabelCanvas, ToolMode
 from .models import ClassDefinition, DatasetEntry, EditOperation
+
+
+class ExportMode(Enum):
+    FULL = "full"
+    SUB_IMAGES = "sub_images"
+
+
+@dataclass
+class ExportOptions:
+    destination: Path
+    mode: ExportMode
+    tile_width: int = 416
+    tile_height: int = 416
 
 
 class MainWindow(QMainWindow):
@@ -62,7 +94,69 @@ class MainWindow(QMainWindow):
         self._suppress_class_dirty = False
         self._controls_last_size = 320
         self._show_original_label = False
+        self._last_export_dir: Optional[Path] = None
+        self._create_actions()
         self._build_ui()
+        self._create_menus()
+
+    def _create_actions(self) -> None:
+        self.load_dataset_action = QAction("Load Dataset...", self)
+        self.load_dataset_action.setShortcut(QKeySequence.Open)
+        self.load_dataset_action.triggered.connect(self.load_dataset)
+
+        self.add_image_action = QAction("Add Image...", self)
+        self.add_image_action.triggered.connect(self._add_single_image)
+
+        self.load_mask_action = QAction("Add Label / Mask...", self)
+        self.load_mask_action.triggered.connect(self._load_mask_for_current)
+
+        self.save_session_action = QAction("Save Session", self)
+        self.save_session_action.setShortcut(QKeySequence.Save)
+        self.save_session_action.triggered.connect(
+            lambda checked=False: self.save_session(prompt_for_path=False)
+        )
+
+        self.save_session_as_action = QAction("Save Session As...", self)
+        self.save_session_as_action.setShortcut(QKeySequence.SaveAs)
+        self.save_session_as_action.triggered.connect(
+            lambda checked=False: self.save_session(prompt_for_path=True)
+        )
+
+        self.revert_label_action = QAction("Revert Current Label", self)
+        self.revert_label_action.triggered.connect(self.revert_current_label)
+
+        self.export_action = QAction("Export...", self)
+        self.export_action.triggered.connect(self.export_labels)
+
+        self.exit_action = QAction("Exit", self)
+        self.exit_action.setShortcut(QKeySequence.Quit)
+        self.exit_action.triggered.connect(self.close)
+
+        self.about_action = QAction("About CNN Dataset Annotation Tool", self)
+        self.about_action.triggered.connect(self.show_about_dialog)
+
+    def _create_menus(self) -> None:
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File")
+        file_menu.addAction(self.load_dataset_action)
+        file_menu.addAction(self.add_image_action)
+        file_menu.addAction(self.load_mask_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.save_session_action)
+        file_menu.addAction(self.save_session_as_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.revert_label_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.export_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.exit_action)
+
+        about_menu = menu_bar.addMenu("&About")
+        about_menu.addAction(self.about_action)
+
+    def show_about_dialog(self) -> None:
+        dialog = AboutDialog(self)
+        dialog.exec()
 
     # ----- UI construction --------------------------------------------------
     def _build_ui(self) -> None:
@@ -71,23 +165,11 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(10, 10, 10, 10)
         root_layout.setSpacing(10)
 
-        # Dataset controls
+        # Dataset summary and controls visibility toggle
         dataset_row = QHBoxLayout()
-        self.load_button = QPushButton("Load Dataset")
-        self.add_image_button = QPushButton("Add Image")
-        self.load_mask_button = QPushButton("Load Mask")
-        self.save_button = QPushButton("Save Session")
-        self.revert_button = QPushButton("Revert Current Label")
-        self.export_button = QPushButton("Export Images && Labels")
-        dataset_row.addWidget(self.load_button)
-        dataset_row.addWidget(self.add_image_button)
-        dataset_row.addWidget(self.load_mask_button)
-        dataset_row.addWidget(self.save_button)
-        dataset_row.addWidget(self.revert_button)
-        dataset_row.addWidget(self.export_button)
-        dataset_row.addStretch(1)
         self.dataset_status = QLabel("No dataset loaded")
         dataset_row.addWidget(self.dataset_status)
+        dataset_row.addStretch(1)
         self.controls_toggle_button = QPushButton("Hide Controls")
         self.controls_toggle_button.setCheckable(True)
         self.controls_toggle_button.setChecked(False)
@@ -272,12 +354,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         # Signal wiring
-        self.load_button.clicked.connect(self.load_dataset)
-        self.add_image_button.clicked.connect(self._add_single_image)
-        self.load_mask_button.clicked.connect(self._load_mask_for_current)
-        self.save_button.clicked.connect(self.save_session)
-        self.revert_button.clicked.connect(self.revert_current_label)
-        self.export_button.clicked.connect(self.export_labels)
         self.image_list.currentRowChanged.connect(self.set_current_index)
         self.alpha_slider.valueChanged.connect(self._handle_alpha_changed)
         self.brush_slider.valueChanged.connect(self._handle_brush_slider_changed)
@@ -1130,9 +1206,6 @@ class MainWindow(QMainWindow):
         if not self.entries:
             QMessageBox.information(self, "Nothing to export", "Load or create entries before exporting.")
             return
-        destination = QFileDialog.getExistingDirectory(self, "Select export directory")
-        if not destination:
-            return
         selected_entries = [entry for entry in self.entries if entry.export_selected]
         if not selected_entries:
             QMessageBox.information(
@@ -1141,25 +1214,49 @@ class MainWindow(QMainWindow):
                 "Mark at least one entry for export via the list context menu.",
             )
             return
-        dest_path = Path(destination)
+        dialog = ExportOptionsDialog(self, initial_dir=self._last_export_dir)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        options = dialog.options()
+        dest_path = options.destination
+        try:
+            dest_path.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Export failed", f"Could not prepare export folder:\n{exc}")
+            return
+        self._last_export_dir = dest_path
+        try:
+            if options.mode == ExportMode.FULL:
+                summary = self._export_full_entries(dest_path, selected_entries)
+            else:
+                summary = self._export_subimage_entries(
+                    dest_path,
+                    selected_entries,
+                    options.tile_width,
+                    options.tile_height,
+                )
+        except RuntimeError as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+        self.statusBar().showMessage(summary, 5000)
+
+    def _prepare_export_dirs(self, dest_path: Path) -> Tuple[Path, Path]:
         images_dir = dest_path / "Images"
         labels_dir = dest_path / "Labels"
         try:
             images_dir.mkdir(parents=True, exist_ok=True)
             labels_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(
-                self,
-                "Export failed",
-                f"Could not prepare export folders:\n{exc}",
-            )
-            return
+            raise RuntimeError(f"Could not prepare export folders:\n{exc}") from exc
+        return images_dir, labels_dir
 
+    def _export_full_entries(self, dest_path: Path, entries: Sequence[DatasetEntry]) -> str:
+        images_dir, labels_dir = self._prepare_export_dirs(dest_path)
         exported_images = 0
         exported_labels = 0
         skipped_images: List[str] = []
         skipped_labels: List[str] = []
-        for entry in selected_entries:
+        for entry in entries:
             if entry.image is not None:
                 image_name = entry.image_path.name if entry.image_path else f"{entry.name}.png"
                 image_output = images_dir / image_name
@@ -1198,13 +1295,71 @@ class MainWindow(QMainWindow):
 
         message = (
             f"Exported {exported_images} image(s) and {exported_labels} label(s) "
-            f"from {len(selected_entries)} marked item(s) to {dest_path}"
+            f"from {len(entries)} marked item(s) to {dest_path}"
         )
         if skipped_images:
             message += f"; skipped {len(skipped_images)} image(s)"
         if skipped_labels:
             message += f"; skipped {len(skipped_labels)} label(s)"
-        self.statusBar().showMessage(message, 5000)
+        return message
+
+    def _export_subimage_entries(
+        self,
+        dest_path: Path,
+        entries: Sequence[DatasetEntry],
+        tile_width: int,
+        tile_height: int,
+    ) -> str:
+        if tile_width <= 0 or tile_height <= 0:
+            raise RuntimeError("Tile dimensions must be positive.")
+        images_dir, labels_dir = self._prepare_export_dirs(dest_path)
+        total_pairs = 0
+        skipped_items: List[str] = []
+        for entry in entries:
+            image = entry.image
+            label = entry.edited_label
+            if image is None or label is None:
+                skipped_items.append(entry.name)
+                continue
+            if image.shape[:2] != label.shape:
+                skipped_items.append(entry.name)
+                continue
+            height, width = label.shape
+            if height < tile_height or width < tile_width:
+                skipped_items.append(entry.name)
+                continue
+            tiles_created = 0
+            tile_index = 1
+            for top in range(0, height - tile_height + 1, tile_height):
+                for left in range(0, width - tile_width + 1, tile_width):
+                    tile_image = image[top : top + tile_height, left : left + tile_width]
+                    tile_label = label[top : top + tile_height, left : left + tile_width]
+                    tile_name = f"{entry.name}_sub_img_{tile_index:03d}"
+                    image_output = images_dir / f"{tile_name}.png"
+                    label_output = labels_dir / f"{tile_name}_label.png"
+                    try:
+                        save_rgb_image(tile_image, image_output)
+                        save_label_image(tile_label, label_output)
+                    except Exception as exc:  # noqa: BLE001
+                        QMessageBox.warning(
+                            self,
+                            "Export warning",
+                            f"Failed to export {tile_name} for {entry.name}: {exc}",
+                        )
+                    else:
+                        tiles_created += 1
+                        total_pairs += 1
+                    finally:
+                        tile_index += 1
+            if tiles_created == 0:
+                skipped_items.append(entry.name)
+        message = (
+            f"Exported {total_pairs} sub-image pair(s) of size {tile_width}x{tile_height} "
+            f"from {len(entries)} item(s) to {dest_path}"
+        )
+        if skipped_items:
+            message += f"; skipped {len(skipped_items)} item(s) (missing data or size mismatch)"
+        return message
 
     # ----- Rendering --------------------------------------------------------
     def _refresh_canvas(self) -> None:
@@ -1316,6 +1471,98 @@ class MainWindow(QMainWindow):
             QMessageBox.No,
         )
         return confirm == QMessageBox.Yes
+
+
+class ExportOptionsDialog(QDialog):
+    """Dialog guiding export configuration."""
+
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        initial_dir: Optional[Path] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export Dataset")
+        self.resize(420, 320)
+        self._initial_dir = str(initial_dir) if initial_dir else ""
+
+        layout = QVBoxLayout(self)
+
+        mode_group_box = QGroupBox("Export Mode")
+        mode_layout = QVBoxLayout(mode_group_box)
+        self.full_radio = QRadioButton("Export full images && labels")
+        self.tiles_radio = QRadioButton("Export sub-images with paired labels")
+        self.full_radio.setChecked(True)
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.addButton(self.full_radio)
+        self.mode_group.addButton(self.tiles_radio)
+        mode_layout.addWidget(self.full_radio)
+        mode_layout.addWidget(self.tiles_radio)
+        layout.addWidget(mode_group_box)
+
+        dimension_box = QGroupBox("Sub-image dimensions (pixels)")
+        dimension_layout = QFormLayout(dimension_box)
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(32, 8192)
+        self.width_spin.setValue(416)
+        self.height_spin = QSpinBox()
+        self.height_spin.setRange(32, 8192)
+        self.height_spin.setValue(416)
+        dimension_layout.addRow("Width", self.width_spin)
+        dimension_layout.addRow("Height", self.height_spin)
+        layout.addWidget(dimension_box)
+
+        destination_box = QGroupBox("Destination folder")
+        destination_layout = QHBoxLayout(destination_box)
+        self.destination_edit = QLineEdit()
+        self.destination_edit.setReadOnly(True)
+        if self._initial_dir:
+            self.destination_edit.setText(self._initial_dir)
+        browse_button = QPushButton("Browse…")
+        browse_button.clicked.connect(self._choose_destination)
+        destination_layout.addWidget(self.destination_edit, 1)
+        destination_layout.addWidget(browse_button)
+        layout.addWidget(destination_box)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        self.full_radio.toggled.connect(self._update_mode_state)
+        self._update_mode_state()
+
+    def _update_mode_state(self) -> None:
+        enable_tiles = self.tiles_radio.isChecked()
+        self.width_spin.setEnabled(enable_tiles)
+        self.height_spin.setEnabled(enable_tiles)
+
+    def _choose_destination(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select export folder",
+            self.destination_edit.text() or self._initial_dir,
+        )
+        if directory:
+            self.destination_edit.setText(directory)
+
+    def accept(self) -> None:  # type: ignore[override]
+        destination = self.destination_edit.text().strip()
+        if not destination:
+            QMessageBox.warning(self, "Destination required", "Select a folder to export the dataset.")
+            return
+        super().accept()
+
+    def options(self) -> ExportOptions:
+        mode = ExportMode.SUB_IMAGES if self.tiles_radio.isChecked() else ExportMode.FULL
+        destination = Path(self.destination_edit.text().strip())
+        return ExportOptions(
+            destination=destination,
+            mode=mode,
+            tile_width=self.width_spin.value(),
+            tile_height=self.height_spin.value(),
+        )
 
 
 def main() -> None:
