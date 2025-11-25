@@ -21,7 +21,8 @@ This document sketches the CNN Dataset Annotation Tool from a product and UX per
 ## Exporting Datasets
 - Choose **File → Export…** to open the export control panel.
 - **Full images & labels:** Writes every selected item into parallel `Images/` and `Labels/` subfolders inside the chosen destination. Existing files are overwritten.
-- **Sub-images for training:** Specify the tile width/height (default 416×416). The exporter walks each selected entry in tile-sized strides, generating filenames like `road_scene_sub_img_001.png` and `road_scene_sub_img_001_label.png`. Entries that lack either an image or label—or that are smaller than the requested tile—are reported in the status bar summary.
+- **Sub-images for training:** Specify the tile width/height (default 416×416). The exporter walks each selected entry in tile-sized strides, generating filenames like `road_scene_sub_img_001.png` in both `Images/` and `Labels/` so basenames match for downstream pairing. Entries that lack either an image or label—or that are smaller than the requested tile—are reported in the status bar summary.
+- Every export also writes `dataset.csv` in the chosen destination, listing image/label paths, the original filename, and (for tiled exports) the tile id plus top-left x/y offsets. Columns for description metadata appear automatically when you add keys in the Description panel.
 
 ## Command-Line Interface (CLI)
 The same dataset format is accessible via the CLI (`python -m cnn_dataset_annotation_tool.cli`). Command usage details live in the repository README and `cnn_dataset_annotation_tool/cli.py` docstrings.

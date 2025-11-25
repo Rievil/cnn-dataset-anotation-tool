@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -95,6 +96,8 @@ class MainWindow(QMainWindow):
         self._controls_last_size = 320
         self._show_original_label = False
         self._last_export_dir: Optional[Path] = None
+        self._metadata_keys: List[str] = []
+        self._updating_description_table = False
         self._create_actions()
         self._build_ui()
         self._create_menus()
@@ -372,6 +375,7 @@ class MainWindow(QMainWindow):
         self.original_radio.toggled.connect(self._handle_label_view_toggled)
         self.add_description_row_button.clicked.connect(self._add_description_row)
         self.remove_description_row_button.clicked.connect(self._remove_description_row)
+        self.description_table.itemChanged.connect(self._handle_description_item_changed)
         self.controls_toggle_button.toggled.connect(self._handle_controls_toggled)
 
         self._undo_shortcut = QShortcut(QKeySequence.Undo, self)
@@ -464,6 +468,9 @@ class MainWindow(QMainWindow):
         classes: Optional[Sequence[ClassDefinition]] = None,
     ) -> None:
         self.entries = entries
+        self._rebuild_metadata_keys()
+        for entry in self.entries:
+            self._ensure_entry_metadata_keys(entry)
         self.image_list.clear()
         self.description_table.setRowCount(0)
         for entry in entries:
@@ -696,6 +703,7 @@ class MainWindow(QMainWindow):
             edited_label=None,
             metadata={},
         )
+        self._ensure_entry_metadata_keys(entry)
         self.entries.append(entry)
         item = QListWidgetItem(entry.name)
         self._style_image_list_item(item, entry)
@@ -810,6 +818,7 @@ class MainWindow(QMainWindow):
             self.current_index = None
             self.canvas.clear()
             self._update_history_view()
+            self._load_description_table()
             return
         self.current_index = row
         self.image_list.setCurrentRow(row)
@@ -819,6 +828,7 @@ class MainWindow(QMainWindow):
             f"Viewing {current_entry.name} ({row + 1}/{len(self.entries)})"
         )
         self._update_history_view()
+        self._load_description_table()
 
     # ----- UI state updates -------------------------------------------------
     def _handle_alpha_changed(self, value: int) -> None:
@@ -913,12 +923,43 @@ class MainWindow(QMainWindow):
     def _update_controls_toggle_text(self, visible: bool) -> None:
         self.controls_toggle_button.setText("Hide Controls" if visible else "Show Controls")
 
+    def _rebuild_metadata_keys(self) -> None:
+        keys: List[str] = []
+        for entry in self.entries:
+            for key in entry.metadata.keys():
+                if key and key not in keys:
+                    keys.append(key)
+        self._metadata_keys = keys
+
+    def _ensure_entry_metadata_keys(self, entry: DatasetEntry) -> None:
+        for key in self._metadata_keys:
+            if key and key not in entry.metadata:
+                entry.metadata[key] = ""
+
+    def _load_description_table(self) -> None:
+        if self.current_index is None or self.current_index < 0 or self.current_index >= len(self.entries):
+            self._updating_description_table = True
+            self.description_table.setRowCount(0)
+            self._updating_description_table = False
+            return
+        entry = self.entries[self.current_index]
+        self._ensure_entry_metadata_keys(entry)
+        self._updating_description_table = True
+        self.description_table.setRowCount(0)
+        for key in self._metadata_keys:
+            row = self.description_table.rowCount()
+            self.description_table.insertRow(row)
+            self.description_table.setItem(row, 0, QTableWidgetItem(key))
+            self.description_table.setItem(row, 1, QTableWidgetItem(entry.metadata.get(key, "")))
+        self._updating_description_table = False
+
     def _add_description_row(self) -> None:
-        row = self.description_table.rowCount()
-        self.description_table.insertRow(row)
-        self.description_table.setItem(row, 0, QTableWidgetItem(""))
-        self.description_table.setItem(row, 1, QTableWidgetItem(""))
-        self.description_table.editItem(self.description_table.item(row, 0))
+        self._metadata_keys.append("")
+        self._session_dirty = True
+        self._load_description_table()
+        last_row = self.description_table.rowCount() - 1
+        if last_row >= 0:
+            self.description_table.editItem(self.description_table.item(last_row, 0))
 
     def _remove_description_row(self) -> None:
         selection = self.description_table.selectionModel()
@@ -927,22 +968,51 @@ class MainWindow(QMainWindow):
         rows = sorted({index.row() for index in selection.selectedRows()}, reverse=True)
         if not rows:
             if self.description_table.rowCount() > 0:
-                self.description_table.removeRow(self.description_table.rowCount() - 1)
-            return
+                rows = [self.description_table.rowCount() - 1]
+            else:
+                return
         for row in rows:
-            self.description_table.removeRow(row)
+            if 0 <= row < len(self._metadata_keys):
+                key = self._metadata_keys.pop(row)
+                if key:
+                    for entry in self.entries:
+                        entry.metadata.pop(key, None)
+        self._session_dirty = True
+        self._load_description_table()
 
-    def _collect_description_entries(self) -> Dict[str, str]:
-        entries: Dict[str, str] = {}
-        for row in range(self.description_table.rowCount()):
-            key_item = self.description_table.item(row, 0)
-            value_item = self.description_table.item(row, 1)
-            key = key_item.text().strip() if key_item else ""
+    def _handle_description_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating_description_table or self.current_index is None:
+            return
+        row = item.row()
+        column = item.column()
+        if row < 0 or row >= len(self._metadata_keys):
+            return
+        current_key = self._metadata_keys[row]
+        if column == 0:
+            new_key = item.text().strip()
+            if new_key == current_key:
+                return
+            if new_key and new_key in self._metadata_keys:
+                # Prevent duplicate keys by restoring the old value.
+                self._updating_description_table = True
+                item.setText(current_key)
+                self._updating_description_table = False
+                return
+            for entry in self.entries:
+                previous_value = entry.metadata.pop(current_key, "") if current_key else ""
+                if new_key:
+                    entry.metadata[new_key] = previous_value
+            self._metadata_keys[row] = new_key
+            self._session_dirty = True
+            self._load_description_table()
+        elif column == 1:
+            key = self._metadata_keys[row]
             if not key:
-                continue
-            value = value_item.text().strip() if value_item else ""
-            entries[key] = value
-        return entries
+                return
+            value = item.text()
+            entry = self.entries[self.current_index]
+            entry.metadata[key] = value
+            self._session_dirty = True
 
     def _handle_classes_changed(self) -> None:
         if not self._suppress_class_dirty:
@@ -1225,11 +1295,13 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export failed", f"Could not prepare export folder:\n{exc}")
             return
         self._last_export_dir = dest_path
+        manifest_rows: List[Dict[str, object]] = []
+        include_subimage_fields = options.mode == ExportMode.SUB_IMAGES
         try:
             if options.mode == ExportMode.FULL:
-                summary = self._export_full_entries(dest_path, selected_entries)
+                summary, manifest_rows = self._export_full_entries(dest_path, selected_entries)
             else:
-                summary = self._export_subimage_entries(
+                summary, manifest_rows = self._export_subimage_entries(
                     dest_path,
                     selected_entries,
                     options.tile_width,
@@ -1238,6 +1310,14 @@ class MainWindow(QMainWindow):
         except RuntimeError as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
             return
+        try:
+            self._write_manifest_csv(dest_path, manifest_rows, include_subimage_fields)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self,
+                "Export warning",
+                f"Export succeeded but writing the manifest CSV failed:\n{exc}",
+            )
         self.statusBar().showMessage(summary, 5000)
 
     def _prepare_export_dirs(self, dest_path: Path) -> Tuple[Path, Path]:
@@ -1250,19 +1330,93 @@ class MainWindow(QMainWindow):
             raise RuntimeError(f"Could not prepare export folders:\n{exc}") from exc
         return images_dir, labels_dir
 
-    def _export_full_entries(self, dest_path: Path, entries: Sequence[DatasetEntry]) -> str:
+    def _gather_metadata_keys(self) -> List[str]:
+        keys: List[str] = []
+        for key in self._metadata_keys:
+            if key and key not in keys:
+                keys.append(key)
+        for entry in self.entries:
+            for key in entry.metadata.keys():
+                if key and key not in keys:
+                    keys.append(key)
+        return keys
+
+    def _build_manifest_row(
+        self,
+        dest_path: Path,
+        image_output: Path,
+        label_output: Path,
+        entry: DatasetEntry,
+        *,
+        subimg_id: Optional[int] = None,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+    ) -> Dict[str, object]:
+        row: Dict[str, object] = {
+            "image_path": str(image_output.relative_to(dest_path)),
+            "label_path": str(label_output.relative_to(dest_path)),
+            "original_name": self._original_entry_name(entry),
+            "subimg_id": subimg_id if subimg_id is not None else "",
+            "x": x if x is not None else "",
+            "y": y if y is not None else "",
+        }
+        for key in self._gather_metadata_keys():
+            row[key] = entry.metadata.get(key, "")
+        return row
+
+    def _write_manifest_csv(
+        self, dest_path: Path, rows: Sequence[Dict[str, object]], include_subimage_fields: bool
+    ) -> None:
+        metadata_keys = self._gather_metadata_keys()
+        fieldnames: List[str] = ["image_path", "label_path", "original_name"]
+        if include_subimage_fields:
+            fieldnames.extend(["subimg_id", "x", "y"])
+        fieldnames.extend(metadata_keys)
+        manifest_path = dest_path / "dataset.csv"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        with manifest_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+    def _original_entry_name(self, entry: DatasetEntry) -> str:
+        if entry.image_path is not None and entry.image_path.name:
+            return entry.image_path.name
+        if entry.label_path is not None and entry.label_path.name:
+            return entry.label_path.name
+        return entry.name
+
+    def _normalize_label_filename(self, source_name: str) -> str:
+        """Remove redundant label suffixes while preserving the extension."""
+        path = Path(source_name)
+        stem = path.stem
+        if stem.endswith("_label"):
+            stem = stem[: -len("_label")]
+        suffix = path.suffix or ".png"
+        return f"{stem}{suffix}"
+
+    def _export_full_entries(
+        self, dest_path: Path, entries: Sequence[DatasetEntry]
+    ) -> Tuple[str, List[Dict[str, object]]]:
         images_dir, labels_dir = self._prepare_export_dirs(dest_path)
         exported_images = 0
         exported_labels = 0
         skipped_images: List[str] = []
         skipped_labels: List[str] = []
+        manifest_rows: List[Dict[str, object]] = []
         for entry in entries:
+            image_saved = False
+            label_saved = False
+            image_output: Optional[Path] = None
+            label_output: Optional[Path] = None
             if entry.image is not None:
                 image_name = entry.image_path.name if entry.image_path else f"{entry.name}.png"
                 image_output = images_dir / image_name
                 try:
                     save_rgb_image(entry.image, image_output)
                     exported_images += 1
+                    image_saved = True
                 except Exception as exc:  # noqa: BLE001
                     skipped_images.append(entry.name)
                     QMessageBox.warning(
@@ -1274,15 +1428,17 @@ class MainWindow(QMainWindow):
                 skipped_images.append(entry.name)
 
             if entry.edited_label is not None:
-                label_name = (
+                label_source_name = (
                     entry.label_path.name
                     if entry.label_path is not None and entry.label_path.name
-                    else f"{entry.name}_label.png"
+                    else f"{entry.name}.png"
                 )
+                label_name = self._normalize_label_filename(label_source_name)
                 label_output = labels_dir / label_name
                 try:
                     save_label_image(entry.edited_label, label_output)
                     exported_labels += 1
+                    label_saved = True
                 except Exception as exc:  # noqa: BLE001
                     skipped_labels.append(entry.name)
                     QMessageBox.warning(
@@ -1293,6 +1449,9 @@ class MainWindow(QMainWindow):
             else:
                 skipped_labels.append(entry.name)
 
+            if image_saved and label_saved and image_output is not None and label_output is not None:
+                manifest_rows.append(self._build_manifest_row(dest_path, image_output, label_output, entry))
+
         message = (
             f"Exported {exported_images} image(s) and {exported_labels} label(s) "
             f"from {len(entries)} marked item(s) to {dest_path}"
@@ -1301,7 +1460,7 @@ class MainWindow(QMainWindow):
             message += f"; skipped {len(skipped_images)} image(s)"
         if skipped_labels:
             message += f"; skipped {len(skipped_labels)} label(s)"
-        return message
+        return message, manifest_rows
 
     def _export_subimage_entries(
         self,
@@ -1309,12 +1468,13 @@ class MainWindow(QMainWindow):
         entries: Sequence[DatasetEntry],
         tile_width: int,
         tile_height: int,
-    ) -> str:
+    ) -> Tuple[str, List[Dict[str, object]]]:
         if tile_width <= 0 or tile_height <= 0:
             raise RuntimeError("Tile dimensions must be positive.")
         images_dir, labels_dir = self._prepare_export_dirs(dest_path)
         total_pairs = 0
         skipped_items: List[str] = []
+        manifest_rows: List[Dict[str, object]] = []
         for entry in entries:
             image = entry.image
             label = entry.edited_label
@@ -1336,7 +1496,7 @@ class MainWindow(QMainWindow):
                     tile_label = label[top : top + tile_height, left : left + tile_width]
                     tile_name = f"{entry.name}_sub_img_{tile_index:03d}"
                     image_output = images_dir / f"{tile_name}.png"
-                    label_output = labels_dir / f"{tile_name}_label.png"
+                    label_output = labels_dir / self._normalize_label_filename(f"{tile_name}.png")
                     try:
                         save_rgb_image(tile_image, image_output)
                         save_label_image(tile_label, label_output)
@@ -1349,6 +1509,17 @@ class MainWindow(QMainWindow):
                     else:
                         tiles_created += 1
                         total_pairs += 1
+                        manifest_rows.append(
+                            self._build_manifest_row(
+                                dest_path,
+                                image_output,
+                                label_output,
+                                entry,
+                                subimg_id=tile_index,
+                                x=left,
+                                y=top,
+                            )
+                        )
                     finally:
                         tile_index += 1
             if tiles_created == 0:
@@ -1359,7 +1530,7 @@ class MainWindow(QMainWindow):
         )
         if skipped_items:
             message += f"; skipped {len(skipped_items)} item(s) (missing data or size mismatch)"
-        return message
+        return message, manifest_rows
 
     # ----- Rendering --------------------------------------------------------
     def _refresh_canvas(self) -> None:
