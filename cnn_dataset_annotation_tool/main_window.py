@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
     QRadioButton,
     QSlider,
     QSpinBox,
@@ -1289,6 +1291,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.Accepted:
             return
         options = dialog.options()
+        class_value_columns = self._final_class_values(options.class_mapping)
         dest_path = options.destination
         try:
             dest_path.mkdir(parents=True, exist_ok=True)
@@ -1296,6 +1299,18 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export failed", f"Could not prepare export folder:\n{exc}")
             return
         self._last_export_dir = dest_path
+        total_steps = self._estimate_total_steps(
+            selected_entries, options.mode, options.tile_width, options.tile_height
+        )
+        progress: Optional[QProgressDialog] = None
+        start_time = time.time()
+        if total_steps > 0:
+            progress = QProgressDialog("Preparing export...", None, 0, total_steps, self)
+            progress.setCancelButton(None)
+            progress.setWindowTitle("Exporting dataset")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            self._update_progress_dialog(progress, 0, total_steps, 0, 0, start_time)
         manifest_rows: List[Dict[str, object]] = []
         include_subimage_fields = options.mode == ExportMode.SUB_IMAGES
         try:
@@ -1304,6 +1319,10 @@ class MainWindow(QMainWindow):
                     dest_path,
                     selected_entries,
                     class_mapping=options.class_mapping,
+                    class_value_columns=class_value_columns,
+                    progress=progress,
+                    progress_total=total_steps,
+                    start_time=start_time,
                 )
             else:
                 summary, manifest_rows = self._export_subimage_entries(
@@ -1312,18 +1331,28 @@ class MainWindow(QMainWindow):
                     options.tile_width,
                     options.tile_height,
                     class_mapping=options.class_mapping,
+                    class_value_columns=class_value_columns,
+                    progress=progress,
+                    progress_total=total_steps,
+                    start_time=start_time,
                 )
         except RuntimeError as exc:
+            if progress is not None:
+                progress.close()
             QMessageBox.critical(self, "Export failed", str(exc))
             return
         try:
-            self._write_manifest_csv(dest_path, manifest_rows, include_subimage_fields)
+            self._write_manifest_csv(
+                dest_path, manifest_rows, include_subimage_fields, class_value_columns
+            )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(
                 self,
                 "Export warning",
                 f"Export succeeded but writing the manifest CSV failed:\n{exc}",
             )
+        if progress is not None:
+            progress.setValue(progress.maximum())
         self.statusBar().showMessage(summary, 5000)
 
     def _prepare_export_dirs(self, dest_path: Path) -> Tuple[Path, Path]:
@@ -1336,6 +1365,59 @@ class MainWindow(QMainWindow):
             raise RuntimeError(f"Could not prepare export folders:\n{exc}") from exc
         return images_dir, labels_dir
 
+    def _estimate_total_steps(
+        self,
+        entries: Sequence[DatasetEntry],
+        mode: ExportMode,
+        tile_width: int,
+        tile_height: int,
+    ) -> int:
+        if mode == ExportMode.FULL:
+            return len(entries)
+        if tile_width <= 0 or tile_height <= 0:
+            return 0
+        total = 0
+        for entry in entries:
+            image = entry.image
+            label = entry.edited_label
+            if image is None or label is None:
+                continue
+            if image.shape[:2] != label.shape:
+                continue
+            height, width = label.shape
+            if height < tile_height or width < tile_width:
+                continue
+            rows = (height - tile_height) // tile_height + 1
+            cols = (width - tile_width) // tile_width + 1
+            total += rows * cols
+        return total
+
+    def _update_progress_dialog(
+        self,
+        progress: Optional[QProgressDialog],
+        done: int,
+        total: int,
+        exported_images: int,
+        exported_labels: int,
+        start_time: float,
+    ) -> None:
+        if progress is None or total <= 0:
+            return
+        done = min(done, total)
+        elapsed = max(time.time() - start_time, 0.0)
+        eta = 0.0
+        if done > 0 and elapsed > 0:
+            remaining = max(total - done, 0)
+            eta = (elapsed / done) * remaining
+        label_text = (
+            f"Exporting {done}/{total} item(s)...\n"
+            f"Images exported: {exported_images}, Labels exported: {exported_labels}\n"
+            f"ETA: {eta:.1f}s"
+        )
+        progress.setLabelText(label_text)
+        progress.setValue(done)
+        QApplication.processEvents()
+
     def _gather_metadata_keys(self) -> List[str]:
         keys: List[str] = []
         for key in self._metadata_keys:
@@ -1347,6 +1429,10 @@ class MainWindow(QMainWindow):
                     keys.append(key)
         return keys
 
+    def _count_class_pixels(self, label: np.ndarray) -> Dict[int, int]:
+        values, counts = np.unique(label, return_counts=True)
+        return {int(v): int(c) for v, c in zip(values.tolist(), counts.tolist())}
+
     def _build_manifest_row(
         self,
         dest_path: Path,
@@ -1357,6 +1443,8 @@ class MainWindow(QMainWindow):
         subimg_id: Optional[int] = None,
         x: Optional[int] = None,
         y: Optional[int] = None,
+        class_counts: Optional[Dict[int, int]] = None,
+        class_value_columns: Sequence[int] = (),
     ) -> Dict[str, object]:
         row: Dict[str, object] = {
             "image_path": str(image_output.relative_to(dest_path)),
@@ -1368,23 +1456,51 @@ class MainWindow(QMainWindow):
         }
         for key in self._gather_metadata_keys():
             row[key] = entry.metadata.get(key, "")
+        if class_counts:
+            targets = list(class_value_columns) if class_value_columns else list(class_counts.keys())
+            for class_value in targets:
+                row[f"class_{class_value}"] = class_counts.get(class_value, 0)
+        elif class_value_columns:
+            for class_value in class_value_columns:
+                row[f"class_{class_value}"] = 0
         return row
 
     def _write_manifest_csv(
-        self, dest_path: Path, rows: Sequence[Dict[str, object]], include_subimage_fields: bool
+        self,
+        dest_path: Path,
+        rows: Sequence[Dict[str, object]],
+        include_subimage_fields: bool,
+        class_value_columns: Sequence[int],
     ) -> None:
+        class_columns = set(class_value_columns)
+        for row in rows:
+            for key in row.keys():
+                if key.startswith("class_"):
+                    try:
+                        value = int(key.split("_", maxsplit=1)[1])
+                    except (ValueError, IndexError):
+                        continue
+                    class_columns.add(value)
         metadata_keys = self._gather_metadata_keys()
         fieldnames: List[str] = ["image_path", "label_path", "original_name"]
         if include_subimage_fields:
             fieldnames.extend(["subimg_id", "x", "y"])
         fieldnames.extend(metadata_keys)
+        for value in sorted(class_columns):
+            fieldnames.append(f"class_{value}")
         manifest_path = dest_path / "dataset.csv"
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         with manifest_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for row in rows:
-                writer.writerow({field: row.get(field, "") for field in fieldnames})
+                normalized_row: Dict[str, object] = {}
+                for field in fieldnames:
+                    if field.startswith("class_"):
+                        normalized_row[field] = row.get(field, 0)
+                    else:
+                        normalized_row[field] = row.get(field, "")
+                writer.writerow(normalized_row)
 
     def _original_entry_name(self, entry: DatasetEntry) -> str:
         if entry.image_path is not None and entry.image_path.name:
@@ -1392,6 +1508,14 @@ class MainWindow(QMainWindow):
         if entry.label_path is not None and entry.label_path.name:
             return entry.label_path.name
         return entry.name
+
+    def _final_class_values(self, class_mapping: Dict[int, int]) -> List[int]:
+        if class_mapping:
+            return sorted({int(value) for value in class_mapping.values()})
+        classes = self.class_manager.get_classes()
+        if classes:
+            return sorted({cls.value for cls in classes})
+        return []
 
     def _normalize_label_filename(self, source_name: str) -> str:
         """Remove redundant label suffixes while preserving the extension."""
@@ -1422,6 +1546,10 @@ class MainWindow(QMainWindow):
         entries: Sequence[DatasetEntry],
         *,
         class_mapping: Optional[Dict[int, int]] = None,
+        class_value_columns: Sequence[int] = (),
+        progress: Optional[QProgressDialog] = None,
+        progress_total: int = 0,
+        start_time: Optional[float] = None,
     ) -> Tuple[str, List[Dict[str, object]]]:
         images_dir, labels_dir = self._prepare_export_dirs(dest_path)
         exported_images = 0
@@ -1429,6 +1557,8 @@ class MainWindow(QMainWindow):
         skipped_images: List[str] = []
         skipped_labels: List[str] = []
         manifest_rows: List[Dict[str, object]] = []
+        processed = 0
+        start = start_time or time.time()
         for entry in entries:
             image_saved = False
             label_saved = False
@@ -1475,7 +1605,20 @@ class MainWindow(QMainWindow):
                 skipped_labels.append(entry.name)
 
             if image_saved and label_saved and image_output is not None and label_output is not None:
-                manifest_rows.append(self._build_manifest_row(dest_path, image_output, label_output, entry))
+                class_counts = self._count_class_pixels(label_to_save)
+                manifest_rows.append(
+                    self._build_manifest_row(
+                        dest_path,
+                        image_output,
+                        label_output,
+                        entry,
+                        class_counts=class_counts,
+                        class_value_columns=class_value_columns,
+                    )
+                )
+
+            processed += 1
+            self._update_progress_dialog(progress, processed, progress_total, exported_images, exported_labels, start)
 
         message = (
             f"Exported {exported_images} image(s) and {exported_labels} label(s) "
@@ -1495,6 +1638,10 @@ class MainWindow(QMainWindow):
         tile_height: int,
         *,
         class_mapping: Optional[Dict[int, int]] = None,
+        class_value_columns: Sequence[int] = (),
+        progress: Optional[QProgressDialog] = None,
+        progress_total: int = 0,
+        start_time: Optional[float] = None,
     ) -> Tuple[str, List[Dict[str, object]]]:
         if tile_width <= 0 or tile_height <= 0:
             raise RuntimeError("Tile dimensions must be positive.")
@@ -1502,6 +1649,8 @@ class MainWindow(QMainWindow):
         total_pairs = 0
         skipped_items: List[str] = []
         manifest_rows: List[Dict[str, object]] = []
+        processed = 0
+        start = start_time or time.time()
         for entry in entries:
             image = entry.image
             label = entry.edited_label
@@ -1537,6 +1686,7 @@ class MainWindow(QMainWindow):
                     else:
                         tiles_created += 1
                         total_pairs += 1
+                        class_counts = self._count_class_pixels(tile_label)
                         manifest_rows.append(
                             self._build_manifest_row(
                                 dest_path,
@@ -1546,10 +1696,16 @@ class MainWindow(QMainWindow):
                                 subimg_id=tile_index,
                                 x=left,
                                 y=top,
+                                class_counts=class_counts,
+                                class_value_columns=class_value_columns,
                             )
                         )
                     finally:
                         tile_index += 1
+                        processed += 1
+                        self._update_progress_dialog(
+                            progress, processed, progress_total, total_pairs, total_pairs, start
+                        )
             if tiles_created == 0:
                 skipped_items.append(entry.name)
         message = (
