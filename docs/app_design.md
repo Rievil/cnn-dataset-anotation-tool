@@ -22,6 +22,7 @@ This document sketches the CNN Dataset Annotation Tool from a product and UX per
 - Choose **File → Export…** to open the export control panel.
 - **Full images & labels:** Writes every selected item into parallel `Images/` and `Labels/` subfolders inside the chosen destination. Existing files are overwritten.
 - **Sub-images for training:** Specify the tile width/height (default 416×416). The exporter walks each selected entry in tile-sized strides, generating filenames like `road_scene_sub_img_001.png` in both `Images/` and `Labels/` so basenames match for downstream pairing. Entries that lack either an image or label—or that are smaller than the requested tile—are reported in the status bar summary.
+- **Class remapping:** The export dialog includes a mapping table so you can merge classes (e.g., map “pores” and “matrix” into “background”) before writing labels. Final pixel values are auto-reindexed to a compact range and previewed in the dialog.
 - Every export also writes `dataset.csv` in the chosen destination, listing image/label paths, the original filename, and (for tiled exports) the tile id plus top-left x/y offsets. Columns for description metadata appear automatically when you add keys in the Description panel.
 
 ## Command-Line Interface (CLI)

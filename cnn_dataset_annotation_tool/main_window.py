@@ -3,10 +3,10 @@ from __future__ import annotations
 import csv
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 from PySide6.QtCore import QObject, QPoint, Qt, QThread, QUrl, Signal
@@ -79,6 +79,7 @@ class ExportOptions:
     mode: ExportMode
     tile_width: int = 416
     tile_height: int = 416
+    class_mapping: Dict[int, int] = field(default_factory=dict)
 
 
 class MainWindow(QMainWindow):
@@ -1284,7 +1285,7 @@ class MainWindow(QMainWindow):
                 "Mark at least one entry for export via the list context menu.",
             )
             return
-        dialog = ExportOptionsDialog(self, initial_dir=self._last_export_dir)
+        dialog = ExportOptionsDialog(self, initial_dir=self._last_export_dir, classes=self.class_manager.get_classes())
         if dialog.exec() != QDialog.Accepted:
             return
         options = dialog.options()
@@ -1299,13 +1300,18 @@ class MainWindow(QMainWindow):
         include_subimage_fields = options.mode == ExportMode.SUB_IMAGES
         try:
             if options.mode == ExportMode.FULL:
-                summary, manifest_rows = self._export_full_entries(dest_path, selected_entries)
+                summary, manifest_rows = self._export_full_entries(
+                    dest_path,
+                    selected_entries,
+                    class_mapping=options.class_mapping,
+                )
             else:
                 summary, manifest_rows = self._export_subimage_entries(
                     dest_path,
                     selected_entries,
                     options.tile_width,
                     options.tile_height,
+                    class_mapping=options.class_mapping,
                 )
         except RuntimeError as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
@@ -1396,8 +1402,26 @@ class MainWindow(QMainWindow):
         suffix = path.suffix or ".png"
         return f"{stem}{suffix}"
 
+    def _apply_class_mapping(self, label: np.ndarray, mapping: Optional[Dict[int, int]]) -> np.ndarray:
+        if not mapping:
+            return label
+        if all(src == dst for src, dst in mapping.items()):
+            return label
+        result = label.copy()
+        present_values = set(np.unique(result).tolist())
+        for src, dst in mapping.items():
+            if src == dst:
+                continue
+            if src in present_values:
+                result[result == src] = dst
+        return result
+
     def _export_full_entries(
-        self, dest_path: Path, entries: Sequence[DatasetEntry]
+        self,
+        dest_path: Path,
+        entries: Sequence[DatasetEntry],
+        *,
+        class_mapping: Optional[Dict[int, int]] = None,
     ) -> Tuple[str, List[Dict[str, object]]]:
         images_dir, labels_dir = self._prepare_export_dirs(dest_path)
         exported_images = 0
@@ -1435,8 +1459,9 @@ class MainWindow(QMainWindow):
                 )
                 label_name = self._normalize_label_filename(label_source_name)
                 label_output = labels_dir / label_name
+                label_to_save = self._apply_class_mapping(entry.edited_label, class_mapping)
                 try:
-                    save_label_image(entry.edited_label, label_output)
+                    save_label_image(label_to_save, label_output)
                     exported_labels += 1
                     label_saved = True
                 except Exception as exc:  # noqa: BLE001
@@ -1468,6 +1493,8 @@ class MainWindow(QMainWindow):
         entries: Sequence[DatasetEntry],
         tile_width: int,
         tile_height: int,
+        *,
+        class_mapping: Optional[Dict[int, int]] = None,
     ) -> Tuple[str, List[Dict[str, object]]]:
         if tile_width <= 0 or tile_height <= 0:
             raise RuntimeError("Tile dimensions must be positive.")
@@ -1494,6 +1521,7 @@ class MainWindow(QMainWindow):
                 for left in range(0, width - tile_width + 1, tile_width):
                     tile_image = image[top : top + tile_height, left : left + tile_width]
                     tile_label = label[top : top + tile_height, left : left + tile_width]
+                    tile_label = self._apply_class_mapping(tile_label, class_mapping)
                     tile_name = f"{entry.name}_sub_img_{tile_index:03d}"
                     image_output = images_dir / f"{tile_name}.png"
                     label_output = labels_dir / self._normalize_label_filename(f"{tile_name}.png")
@@ -1652,11 +1680,14 @@ class ExportOptionsDialog(QDialog):
         parent: Optional[QWidget] = None,
         *,
         initial_dir: Optional[Path] = None,
+        classes: Optional[Sequence[ClassDefinition]] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Export Dataset")
         self.resize(420, 320)
         self._initial_dir = str(initial_dir) if initial_dir else ""
+        self._classes: List[ClassDefinition] = list(classes or [])
+        self._final_class_mapping: Dict[int, int] = {}
 
         layout = QVBoxLayout(self)
 
@@ -1696,6 +1727,9 @@ class ExportOptionsDialog(QDialog):
         destination_layout.addWidget(browse_button)
         layout.addWidget(destination_box)
 
+        if self._classes:
+            layout.addWidget(self._build_class_remap_box())
+
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
@@ -1728,11 +1762,108 @@ class ExportOptionsDialog(QDialog):
     def options(self) -> ExportOptions:
         mode = ExportMode.SUB_IMAGES if self.tiles_radio.isChecked() else ExportMode.FULL
         destination = Path(self.destination_edit.text().strip())
+        class_mapping = self._compute_final_class_mapping() if self._classes else {}
         return ExportOptions(
             destination=destination,
             mode=mode,
             tile_width=self.width_spin.value(),
             tile_height=self.height_spin.value(),
+            class_mapping=class_mapping,
+        )
+
+    # ----- Class remapping panel -------------------------------------------
+    def _build_class_remap_box(self) -> QGroupBox:
+        box = QGroupBox("Class remapping")
+        layout = QVBoxLayout(box)
+        hint = QLabel(
+            "Choose how each source class should be exported. Multiple source classes can be merged into "
+            "a single target class. Final pixel values are auto-reindexed so the exported dataset uses a "
+            "compact range."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.class_table = QTableWidget(len(self._classes), 3)
+        self.class_table.setHorizontalHeaderLabels(["Source class", "Map to", "Final value"])
+        self.class_table.horizontalHeader().setStretchLastSection(True)
+        self.class_table.verticalHeader().setVisible(False)
+        self.class_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.class_table.setSelectionMode(QAbstractItemView.NoSelection)
+        layout.addWidget(self.class_table)
+
+        self._target_combo_refs: List[QComboBox] = []
+        for row, cls in enumerate(self._classes):
+            source_item = QTableWidgetItem(f"{cls.name} ({cls.value})")
+            source_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.class_table.setItem(row, 0, source_item)
+
+            combo = QComboBox()
+            for target in self._classes:
+                combo.addItem(f"{target.name} ({target.value})", target.value)
+            combo.setCurrentIndex(combo.findData(cls.value))
+            combo.currentIndexChanged.connect(self._update_final_class_values)
+            self.class_table.setCellWidget(row, 1, combo)
+            self._target_combo_refs.append(combo)
+
+            final_item = QTableWidgetItem("")
+            final_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.class_table.setItem(row, 2, final_item)
+
+        self.reindex_summary = QLabel()
+        self.reindex_summary.setWordWrap(True)
+        layout.addWidget(self.reindex_summary)
+
+        self._update_final_class_values()
+        return box
+
+    def _compute_final_class_mapping(self) -> Dict[int, int]:
+        if not self._classes:
+            return {}
+        selection: List[Tuple[int, int]] = []
+        for row, cls in enumerate(self._classes):
+            combo = cast(QComboBox, self.class_table.cellWidget(row, 1))
+            target_value_raw = combo.currentData() if combo is not None else cls.value
+            target_value = int(target_value_raw) if target_value_raw is not None else cls.value
+            selection.append((cls.value, target_value))
+
+        target_to_new: Dict[int, int] = {}
+        next_value = 0
+        for _, target_value in selection:
+            if target_value not in target_to_new:
+                target_to_new[target_value] = next_value
+                next_value += 1
+
+        mapping: Dict[int, int] = {}
+        for source_value, target_value in selection:
+            mapping[source_value] = target_to_new.get(target_value, source_value)
+        self._final_class_mapping = mapping
+        return mapping
+
+    def _update_final_class_values(self) -> None:
+        mapping = self._compute_final_class_mapping()
+        value_to_name = {cls.value: cls.name for cls in self._classes}
+        target_order: List[Tuple[str, int]] = []
+        seen_targets: Dict[int, int] = {}
+        for cls, combo in zip(self._classes, self._target_combo_refs):
+            target_raw = combo.currentData() if combo is not None else cls.value
+            target_value = int(target_raw) if target_raw is not None else cls.value
+            if target_value not in seen_targets:
+                final_value = mapping.get(target_value, target_value)
+                seen_targets[target_value] = final_value
+                target_order.append((value_to_name.get(target_value, str(target_value)), final_value))
+
+        for row, cls in enumerate(self._classes):
+            final_value = mapping.get(cls.value, cls.value)
+            item = self.class_table.item(row, 2)
+            if item is None:
+                item = QTableWidgetItem()
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.class_table.setItem(row, 2, item)
+            item.setText(str(final_value))
+
+        summary_parts = [f"{name} → {value}" for name, value in target_order]
+        self.reindex_summary.setText(
+            "Final class values: " + ", ".join(summary_parts) if summary_parts else "No class remapping configured."
         )
 
 
