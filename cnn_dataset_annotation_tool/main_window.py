@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import csv
+import json
+import math
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast, Mapping
 
 import numpy as np
 from PySide6.QtCore import QObject, QPoint, Qt, QThread, QUrl, Signal
@@ -26,6 +29,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QButtonGroup,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -56,7 +60,7 @@ from PySide6.QtWidgets import (
 
 from .about_dialog import AboutDialog
 from .class_manager import ClassManagerWidget
-from .constants import fallback_color
+from .constants import WIDTH_MEASUREMENTS_KEY, fallback_color
 from .io_utils import (
     load_dataset_from_folders,
     load_entries_from_parquet,
@@ -82,6 +86,8 @@ class ExportOptions:
     tile_width: int = 416
     tile_height: int = 416
     class_mapping: Dict[int, int] = field(default_factory=dict)
+    include_images: bool = True
+    class_labels: Dict[int, str] = field(default_factory=dict)
 
 
 class MainWindow(QMainWindow):
@@ -101,6 +107,7 @@ class MainWindow(QMainWindow):
         self._last_export_dir: Optional[Path] = None
         self._metadata_keys: List[str] = []
         self._updating_description_table = False
+        self._skeleton_cache: Optional[Dict[str, np.ndarray]] = None
         self._create_actions()
         self._build_ui()
         self._create_menus()
@@ -134,6 +141,12 @@ class MainWindow(QMainWindow):
         self.export_action = QAction("Export...", self)
         self.export_action.triggered.connect(self.export_labels)
 
+        self.export_measurements_action = QAction("Export Width Measurements (CSV)...", self)
+        self.export_measurements_action.triggered.connect(self.export_width_measurements)
+
+        self.import_measurements_action = QAction("Import Width Measurements (CSV)...", self)
+        self.import_measurements_action.triggered.connect(self.import_width_measurements)
+
         self.exit_action = QAction("Exit", self)
         self.exit_action.setShortcut(QKeySequence.Quit)
         self.exit_action.triggered.connect(self.close)
@@ -154,6 +167,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.revert_label_action)
         file_menu.addSeparator()
         file_menu.addAction(self.export_action)
+        file_menu.addAction(self.export_measurements_action)
+        file_menu.addAction(self.import_measurements_action)
         file_menu.addSeparator()
         file_menu.addAction(self.exit_action)
 
@@ -261,7 +276,8 @@ class MainWindow(QMainWindow):
             "Brush left click: source → target, right click: target → source.\n"
             "Lasso: hold left to trace an area, release to fill. Right click cancels. Magnetic lasso snaps to edges.\n"
             "Polygon: click to place vertices, click the start point to close. Right click closes with swapped classes or cancels.\n"
-            "Polygon Line: click to place points along the crack. Mouse wheel adjusts thickness. Close on the start point to apply; right click reverses classes."
+            "Polygon Line: click to place points along the crack. Mouse wheel adjusts thickness. Close on the start point to apply; right click reverses classes.\n"
+            "Measure Width: left click on the two opposite crack edges to record a width. Right click cancels the first point or deletes the nearest measurement. Measurements are saved with the session and exported via File → Export Width Measurements."
         )
         brush_hint.setWordWrap(True)
         control_layout.addWidget(brush_hint, 3, 0, 1, 3)
@@ -284,10 +300,50 @@ class MainWindow(QMainWindow):
         self.tool_combo.addItem("Polygon", ToolMode.POLYGON)
         self.tool_combo.addItem("Polygon Line", ToolMode.POLYLINE)
         self.tool_combo.addItem("Magnetic Lasso", ToolMode.MAGNETIC_LASSO)
+        self.tool_combo.addItem("Measure Width", ToolMode.MEASURE)
         control_layout.addWidget(QLabel("Editing Tool"), 7, 0)
         control_layout.addWidget(self.tool_combo, 7, 1, 1, 2)
 
+        self.measure_labels_checkbox = QCheckBox("Show measured values")
+        self.measure_labels_checkbox.setChecked(True)
+        self.measure_labels_checkbox.setVisible(False)
+        control_layout.addWidget(self.measure_labels_checkbox, 8, 0, 1, 3)
+
+        self.annotator_label = QLabel("Annotator")
+        self.annotator_edit = QLineEdit()
+        self.annotator_edit.setPlaceholderText("name stored with each measurement")
+        self.annotator_label.setVisible(False)
+        self.annotator_edit.setVisible(False)
+        control_layout.addWidget(self.annotator_label, 9, 0)
+        control_layout.addWidget(self.annotator_edit, 9, 1, 1, 2)
+
         tools_layout.addWidget(control_panel)
+
+        # Distance map / skeleton visualization
+        skeleton_panel = QGroupBox("Distance Map / Skeleton View")
+        skeleton_layout = QGridLayout(skeleton_panel)
+        skeleton_layout.setContentsMargins(8, 8, 8, 8)
+        skeleton_layout.setHorizontalSpacing(12)
+        skeleton_layout.setVerticalSpacing(6)
+
+        self.skeleton_checkbox = QCheckBox("Show distance map + skeleton")
+        skeleton_layout.addWidget(self.skeleton_checkbox, 0, 0, 1, 2)
+
+        skeleton_layout.addWidget(QLabel("Class"), 1, 0)
+        self.skeleton_class_combo = QComboBox()
+        skeleton_layout.addWidget(self.skeleton_class_combo, 1, 1)
+
+        skeleton_hint = QLabel(
+            "Colors the selected class by its Euclidean distance to the class edge "
+            "(dark blue = edge, yellow = center) and draws the medial skeleton in red — "
+            "the same construction as the crack-width metric (width = 2 × distance at the "
+            "skeleton). Uses the currently displayed label; recomputed after each edit, so "
+            "turn it off while editing large masks."
+        )
+        skeleton_hint.setWordWrap(True)
+        skeleton_layout.addWidget(skeleton_hint, 2, 0, 1, 2)
+
+        tools_layout.addWidget(skeleton_panel)
 
         # Class manager block
         self.class_manager = ClassManagerWidget()
@@ -372,6 +428,11 @@ class MainWindow(QMainWindow):
         self.canvas.operationPerformed.connect(self._record_operation)
         self.canvas.polylineWidthChanged.connect(self._handle_polyline_width_changed)
         self.canvas.brushRadiusChanged.connect(self._handle_canvas_brush_radius_changed)
+        self.canvas.measurementsChanged.connect(self._handle_measurements_changed)
+        self.measure_labels_checkbox.toggled.connect(self.canvas.set_measure_labels_visible)
+        self.skeleton_checkbox.toggled.connect(self._handle_skeleton_view_toggled)
+        self.skeleton_class_combo.currentIndexChanged.connect(self._handle_skeleton_class_changed)
+        self.annotator_edit.textChanged.connect(self.canvas.set_annotator)
         self.class_manager.classesChanged.connect(self._handle_classes_changed)
         self.class_manager.autoPopulateRequested.connect(self._auto_populate_classes)
         self.edited_radio.toggled.connect(self._handle_label_view_toggled)
@@ -858,6 +919,63 @@ class MainWindow(QMainWindow):
     def _handle_polyline_width_changed(self, width: int) -> None:
         self.polyline_thickness_label.setText(f"Line Thickness: {width} px")
 
+    def _measurements_for_entry(self, entry: DatasetEntry) -> List[Dict[str, float]]:
+        raw = entry.metadata.get(WIDTH_MEASUREMENTS_KEY, "")
+        if not raw:
+            return []
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(decoded, list):
+            return []
+        measurements: List[Dict[str, object]] = []
+        for item in decoded:
+            if not isinstance(item, dict):
+                continue
+            try:
+                parsed: Dict[str, object] = {
+                    "x1": float(item["x1"]),
+                    "y1": float(item["y1"]),
+                    "x2": float(item["x2"]),
+                    "y2": float(item["y2"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+            annotator = str(item.get("annotator", "")).strip()
+            if annotator:
+                parsed["annotator"] = annotator
+            measurements.append(parsed)
+        return measurements
+
+    @staticmethod
+    def _serialize_measurements(measurements: List[Dict[str, object]]) -> str:
+        return json.dumps(
+            [
+                {
+                    key: (round(value, 3) if isinstance(value, (int, float)) else value)
+                    for key, value in item.items()
+                }
+                for item in measurements
+            ]
+        )
+
+    def _handle_measurements_changed(self) -> None:
+        if self.current_index is None or self.current_index >= len(self.entries):
+            return
+        entry = self.entries[self.current_index]
+        measurements = self.canvas.measurements()
+        if measurements:
+            entry.metadata[WIDTH_MEASUREMENTS_KEY] = self._serialize_measurements(measurements)
+        else:
+            entry.metadata.pop(WIDTH_MEASUREMENTS_KEY, None)
+        self._session_dirty = True
+        self._rebuild_metadata_keys()
+        self._load_description_table()
+        self.statusBar().showMessage(
+            f"{entry.name}: {len(measurements)} width measurement(s)", 3000
+        )
+
     def _handle_tool_changed(self, index: int) -> None:
         data = self.tool_combo.itemData(index)
         mode = data if isinstance(data, ToolMode) else ToolMode.BRUSH
@@ -869,6 +987,9 @@ class MainWindow(QMainWindow):
         self.brush_slider.setEnabled(is_brush)
         self.brush_spin.setEnabled(is_brush)
         self.polyline_thickness_label.setVisible(mode == ToolMode.POLYLINE)
+        self.measure_labels_checkbox.setVisible(mode == ToolMode.MEASURE)
+        self.annotator_label.setVisible(mode == ToolMode.MEASURE)
+        self.annotator_edit.setVisible(mode == ToolMode.MEASURE)
 
     def _handle_label_view_toggled(self) -> None:
         show_original = self.original_radio.isChecked()
@@ -1058,6 +1179,24 @@ class MainWindow(QMainWindow):
         self.target_combo.blockSignals(False)
         self._update_paint_values()
 
+        self.skeleton_class_combo.blockSignals(True)
+        previous_value = self.skeleton_class_combo.currentData()
+        self.skeleton_class_combo.clear()
+        for cls in classes:
+            self.skeleton_class_combo.addItem(f"{cls.name} ({cls.value})", cls.value)
+        selected = -1
+        for idx in range(self.skeleton_class_combo.count()):
+            if self.skeleton_class_combo.itemData(idx) == previous_value:
+                selected = idx
+                break
+        if selected < 0:
+            for idx, cls in enumerate(classes):
+                if "crack" in cls.name.lower():
+                    selected = idx
+                    break
+        self.skeleton_class_combo.setCurrentIndex(max(selected, 0) if classes else -1)
+        self.skeleton_class_combo.blockSignals(False)
+
     def _class_label_for_value(self, value: int) -> str:
         for cls in self.class_manager.get_classes():
             if cls.value == value:
@@ -1068,6 +1207,111 @@ class MainWindow(QMainWindow):
         source = self.source_combo.currentData()
         target = self.target_combo.currentData()
         self.canvas.set_paint_values(source, target)
+
+    # ----- Distance map / skeleton view --------------------------------------
+    def _handle_skeleton_view_toggled(self, checked: bool) -> None:
+        if checked and self._skeleton_dependencies() is None:
+            QMessageBox.warning(
+                self,
+                "Missing dependencies",
+                "The distance map / skeleton view needs scipy and scikit-image.\n"
+                "Install them with:  pip install scipy scikit-image",
+            )
+            self.skeleton_checkbox.blockSignals(True)
+            self.skeleton_checkbox.setChecked(False)
+            self.skeleton_checkbox.blockSignals(False)
+            return
+        if not checked:
+            self._skeleton_cache = None
+        self._refresh_canvas()
+
+    def _handle_skeleton_class_changed(self, index: int) -> None:
+        self._skeleton_cache = None
+        if self.skeleton_checkbox.isChecked():
+            self._refresh_canvas()
+
+    @staticmethod
+    def _skeleton_dependencies():
+        try:
+            from scipy import ndimage as scipy_ndimage
+            from skimage.morphology import skeletonize
+        except ImportError:
+            return None
+        return scipy_ndimage, skeletonize
+
+    def _render_skeleton_overlay(
+        self,
+        image: np.ndarray,
+        labels: Optional[np.ndarray],
+        class_value: Optional[int],
+        alpha: float,
+    ) -> Optional[QPixmap]:
+        if labels is None or class_value is None:
+            return None
+        deps = self._skeleton_dependencies()
+        if deps is None:
+            return None
+        scipy_ndimage, skeletonize = deps
+        label_values = np.asarray(labels, dtype=np.int32)
+        if label_values.shape != np.asarray(image).shape[:2]:
+            return None
+        mask = label_values == int(class_value)
+        cache = self._skeleton_cache
+        if (
+            cache is None
+            or cache["value"] != int(class_value)
+            or cache["mask"].shape != mask.shape
+            or not np.array_equal(cache["mask"], mask)
+        ):
+            if not mask.any():
+                self.statusBar().showMessage(
+                    f"Class {class_value} has no pixels in the displayed label.", 4000
+                )
+                return None
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                start = time.perf_counter()
+                edt = scipy_ndimage.distance_transform_edt(mask)
+                skeleton = skeletonize(mask)
+                # dilate by 1 px so the skeleton stays visible when zoomed out
+                skeleton = scipy_ndimage.binary_dilation(skeleton)
+                max_dist = float(edt.max())
+                normalized = (edt / max_dist) if max_dist > 0 else edt
+                # dark blue (edge) -> yellow (center) ramp inside the mask
+                ramp_from = np.array([15.0, 45.0, 130.0], dtype=np.float32)
+                ramp_to = np.array([255.0, 225.0, 40.0], dtype=np.float32)
+                colors = np.zeros((*mask.shape, 3), dtype=np.uint8)
+                t = normalized[mask][:, np.newaxis].astype(np.float32)
+                colors[mask] = np.clip(ramp_from + t * (ramp_to - ramp_from), 0, 255).astype(np.uint8)
+                elapsed = time.perf_counter() - start
+                self._skeleton_cache = {
+                    "value": int(class_value),
+                    "mask": mask,
+                    "colors": colors,
+                    "skeleton": skeleton,
+                }
+                self.statusBar().showMessage(
+                    f"Distance map + skeleton computed in {elapsed:.1f} s "
+                    f"(max half-width {max_dist:.1f} px)",
+                    5000,
+                )
+            finally:
+                QApplication.restoreOverrideCursor()
+            cache = self._skeleton_cache
+        blend_alpha = np.clip(max(alpha, 0.35), 0.0, 1.0)
+        image_rgb = np.asarray(image, dtype=np.float32)
+        if image_rgb.ndim == 2:
+            image_rgb = np.stack([image_rgb] * 3, axis=-1)
+        blended = image_rgb.copy()
+        blended[mask] = (
+            image_rgb[mask] * (1.0 - blend_alpha)
+            + cache["colors"][mask].astype(np.float32) * blend_alpha
+        )
+        blended[cache["skeleton"]] = (230.0, 30.0, 30.0)
+        blended = np.clip(blended, 0, 255).astype(np.uint8)
+        height, width, _ = blended.shape
+        qimage = QImage(blended.data, width, height, 3 * width, QImage.Format_RGB888)
+        return QPixmap.fromImage(qimage.copy())
 
     def _switch_classes(self) -> None:
         if self.current_index is None:
@@ -1292,6 +1536,7 @@ class MainWindow(QMainWindow):
             return
         options = dialog.options()
         class_value_columns = self._final_class_values(options.class_mapping)
+        class_columns = self._class_column_names(class_value_columns, options.class_labels)
         dest_path = options.destination
         try:
             dest_path.mkdir(parents=True, exist_ok=True)
@@ -1319,7 +1564,8 @@ class MainWindow(QMainWindow):
                     dest_path,
                     selected_entries,
                     class_mapping=options.class_mapping,
-                    class_value_columns=class_value_columns,
+                    class_columns=class_columns,
+                    include_images=options.include_images,
                     progress=progress,
                     progress_total=total_steps,
                     start_time=start_time,
@@ -1331,7 +1577,8 @@ class MainWindow(QMainWindow):
                     options.tile_width,
                     options.tile_height,
                     class_mapping=options.class_mapping,
-                    class_value_columns=class_value_columns,
+                    class_columns=class_columns,
+                    include_images=options.include_images,
                     progress=progress,
                     progress_total=total_steps,
                     start_time=start_time,
@@ -1343,7 +1590,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self._write_manifest_csv(
-                dest_path, manifest_rows, include_subimage_fields, class_value_columns
+                dest_path, manifest_rows, include_subimage_fields, class_columns
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(
@@ -1355,11 +1602,193 @@ class MainWindow(QMainWindow):
             progress.setValue(progress.maximum())
         self.statusBar().showMessage(summary, 5000)
 
-    def _prepare_export_dirs(self, dest_path: Path) -> Tuple[Path, Path]:
-        images_dir = dest_path / "Images"
+    def export_width_measurements(self) -> None:
+        rows: List[List[object]] = []
+        for entry in self.entries:
+            measurements = self._measurements_for_entry(entry)
+            if not measurements:
+                continue
+            label = entry.edited_label if entry.edited_label is not None else entry.original_label
+            for index, item in enumerate(measurements):
+                width_px = math.hypot(item["x2"] - item["x1"], item["y2"] - item["y1"])
+                mid_x = (item["x1"] + item["x2"]) * 0.5
+                mid_y = (item["y1"] + item["y2"]) * 0.5
+                label_value_mid: object = ""
+                if label is not None:
+                    row_idx = int(round(mid_y))
+                    col_idx = int(round(mid_x))
+                    if 0 <= row_idx < label.shape[0] and 0 <= col_idx < label.shape[1]:
+                        label_value_mid = int(label[row_idx, col_idx])
+                rows.append(
+                    [
+                        entry.name,
+                        entry.image_path.name if entry.image_path else "",
+                        entry.label_path.name if entry.label_path else "",
+                        index,
+                        item.get("annotator", ""),
+                        f"{item['x1']:.2f}",
+                        f"{item['y1']:.2f}",
+                        f"{item['x2']:.2f}",
+                        f"{item['y2']:.2f}",
+                        f"{width_px:.3f}",
+                        label_value_mid,
+                    ]
+                )
+        if not rows:
+            QMessageBox.information(
+                self,
+                "No measurements",
+                "No width measurements recorded yet. Use the Measure Width tool first.",
+            )
+            return
+        directory = str(self._session_path.parent) if self._session_path else ""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export width measurements",
+            directory,
+            "CSV Files (*.csv);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+        target_path = Path(file_path)
+        if target_path.suffix.lower() != ".csv":
+            target_path = target_path.with_suffix(".csv")
+        try:
+            with open(target_path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(
+                    [
+                        "entry",
+                        "image_file",
+                        "label_file",
+                        "measure_idx",
+                        "annotator",
+                        "x1_px",
+                        "y1_px",
+                        "x2_px",
+                        "y2_px",
+                        "width_px",
+                        "label_value_at_mid",
+                    ]
+                )
+                writer.writerows(rows)
+        except OSError as exc:
+            QMessageBox.critical(self, "Export failed", f"Could not write CSV file:\n{exc}")
+            return
+        self.statusBar().showMessage(
+            f"Exported {len(rows)} width measurement(s) to {target_path}", 5000
+        )
+
+    def import_width_measurements(self) -> None:
+        if not self.entries:
+            QMessageBox.information(self, "No dataset", "Load a dataset before importing measurements.")
+            return
+        directory = str(self._session_path.parent) if self._session_path else ""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import width measurements",
+            directory,
+            "CSV Files (*.csv);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, newline="", encoding="utf-8-sig") as handle:
+                rows = list(csv.DictReader(handle))
+        except (OSError, csv.Error) as exc:
+            QMessageBox.critical(self, "Import failed", f"Could not read CSV file:\n{exc}")
+            return
+        required = {"x1_px", "y1_px", "x2_px", "y2_px"}
+        if not rows or not required.issubset(rows[0].keys()):
+            QMessageBox.critical(
+                self,
+                "Import failed",
+                "The CSV must contain the columns x1_px, y1_px, x2_px, y2_px and an\n"
+                "'entry' or 'image_file' column to match the measurements to entries\n"
+                "(the format written by Export Width Measurements).",
+            )
+            return
+        imported, duplicates, unmatched = self._import_measurement_rows(rows)
+        if imported:
+            self._session_dirty = True
+            self._rebuild_metadata_keys()
+            self._load_description_table()
+            self._refresh_canvas()
+        QMessageBox.information(
+            self,
+            "Import finished",
+            f"Imported {imported} measurement(s).\n"
+            f"Skipped {duplicates} duplicate(s).\n"
+            f"{unmatched} row(s) did not match any entry or were invalid.",
+        )
+
+    def _import_measurement_rows(self, rows: List[Dict[str, str]]) -> Tuple[int, int, int]:
+        """Merge CSV rows into per-entry measurements. Returns (imported, duplicates, unmatched)."""
+        by_name = {entry.name: entry for entry in self.entries}
+        by_image = {
+            entry.image_path.name: entry for entry in self.entries if entry.image_path is not None
+        }
+        default_annotator = self.annotator_edit.text().strip() or "imported"
+
+        staged: Dict[str, List[Dict[str, object]]] = {}
+        seen: Dict[str, set] = {}
+
+        def measurement_key(item: Dict[str, object]) -> Tuple[object, ...]:
+            return (
+                round(float(item["x1"]), 2),
+                round(float(item["y1"]), 2),
+                round(float(item["x2"]), 2),
+                round(float(item["y2"]), 2),
+                str(item.get("annotator", "")),
+            )
+
+        imported = duplicates = unmatched = 0
+        for row in rows:
+            entry = by_name.get((row.get("entry") or "").strip()) or by_image.get(
+                (row.get("image_file") or "").strip()
+            )
+            if entry is None:
+                unmatched += 1
+                continue
+            try:
+                item: Dict[str, object] = {
+                    "x1": round(float(row["x1_px"]), 3),
+                    "y1": round(float(row["y1_px"]), 3),
+                    "x2": round(float(row["x2_px"]), 3),
+                    "y2": round(float(row["y2_px"]), 3),
+                }
+            except (KeyError, TypeError, ValueError):
+                unmatched += 1
+                continue
+            annotator = (row.get("annotator") or "").strip() or default_annotator
+            item["annotator"] = annotator
+            if entry.name not in staged:
+                existing = self._measurements_for_entry(entry)
+                staged[entry.name] = existing
+                seen[entry.name] = {measurement_key(m) for m in existing}
+            key = measurement_key(item)
+            if key in seen[entry.name]:
+                duplicates += 1
+                continue
+            staged[entry.name].append(item)
+            seen[entry.name].add(key)
+            imported += 1
+
+        if imported:
+            for name, measurements in staged.items():
+                entry = by_name[name]
+                if measurements:
+                    entry.metadata[WIDTH_MEASUREMENTS_KEY] = self._serialize_measurements(measurements)
+                else:
+                    entry.metadata.pop(WIDTH_MEASUREMENTS_KEY, None)
+        return imported, duplicates, unmatched
+
+    def _prepare_export_dirs(self, dest_path: Path, *, include_images: bool) -> Tuple[Optional[Path], Path]:
+        images_dir = dest_path / "Images" if include_images else None
         labels_dir = dest_path / "Labels"
         try:
-            images_dir.mkdir(parents=True, exist_ok=True)
+            if images_dir:
+                images_dir.mkdir(parents=True, exist_ok=True)
             labels_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Could not prepare export folders:\n{exc}") from exc
@@ -1429,6 +1858,25 @@ class MainWindow(QMainWindow):
                     keys.append(key)
         return keys
 
+    def _sanitize_column_label(self, label: str) -> str:
+        sanitized = re.sub(r"[^0-9A-Za-z]+", "_", label.strip())
+        sanitized = sanitized.strip("_")
+        return sanitized.lower() if sanitized else ""
+
+    def _class_column_names(
+        self, final_values: Sequence[int], class_labels: Mapping[int, str]
+    ) -> Dict[int, str]:
+        names: Dict[int, str] = {}
+        used: set[str] = set()
+        for value in sorted({int(v) for v in final_values}):
+            base_label = class_labels.get(value, f"class_{value}")
+            sanitized = self._sanitize_column_label(base_label) or f"class_{value}"
+            candidate = f"{sanitized}_px_sum"
+            unique = candidate if candidate not in used else f"{candidate}_{value}"
+            used.add(unique)
+            names[value] = unique
+        return names
+
     def _count_class_pixels(self, label: np.ndarray) -> Dict[int, int]:
         values, counts = np.unique(label, return_counts=True)
         return {int(v): int(c) for v, c in zip(values.tolist(), counts.tolist())}
@@ -1436,7 +1884,7 @@ class MainWindow(QMainWindow):
     def _build_manifest_row(
         self,
         dest_path: Path,
-        image_output: Path,
+        image_output: Optional[Path],
         label_output: Path,
         entry: DatasetEntry,
         *,
@@ -1444,10 +1892,10 @@ class MainWindow(QMainWindow):
         x: Optional[int] = None,
         y: Optional[int] = None,
         class_counts: Optional[Dict[int, int]] = None,
-        class_value_columns: Sequence[int] = (),
+        class_columns: Optional[Mapping[int, str]] = None,
     ) -> Dict[str, object]:
         row: Dict[str, object] = {
-            "image_path": str(image_output.relative_to(dest_path)),
+            "image_path": str(image_output.relative_to(dest_path)) if image_output else "",
             "label_path": str(label_output.relative_to(dest_path)),
             "original_name": self._original_entry_name(entry),
             "subimg_id": subimg_id if subimg_id is not None else "",
@@ -1456,13 +1904,15 @@ class MainWindow(QMainWindow):
         }
         for key in self._gather_metadata_keys():
             row[key] = entry.metadata.get(key, "")
+        columns = dict(class_columns) if class_columns else {}
         if class_counts:
-            targets = list(class_value_columns) if class_value_columns else list(class_counts.keys())
+            targets = list(columns.keys()) if columns else list(class_counts.keys())
             for class_value in targets:
-                row[f"class_{class_value}"] = class_counts.get(class_value, 0)
-        elif class_value_columns:
-            for class_value in class_value_columns:
-                row[f"class_{class_value}"] = 0
+                column_name = columns.get(class_value, f"class_{class_value}_px_sum")
+                row[column_name] = class_counts.get(class_value, 0)
+        elif columns:
+            for class_value, column_name in columns.items():
+                row[column_name] = 0
         return row
 
     def _write_manifest_csv(
@@ -1470,24 +1920,25 @@ class MainWindow(QMainWindow):
         dest_path: Path,
         rows: Sequence[Dict[str, object]],
         include_subimage_fields: bool,
-        class_value_columns: Sequence[int],
+        class_columns: Mapping[int, str],
     ) -> None:
-        class_columns = set(class_value_columns)
-        for row in rows:
-            for key in row.keys():
-                if key.startswith("class_"):
-                    try:
-                        value = int(key.split("_", maxsplit=1)[1])
-                    except (ValueError, IndexError):
-                        continue
-                    class_columns.add(value)
         metadata_keys = self._gather_metadata_keys()
         fieldnames: List[str] = ["image_path", "label_path", "original_name"]
         if include_subimage_fields:
             fieldnames.extend(["subimg_id", "x", "y"])
         fieldnames.extend(metadata_keys)
-        for value in sorted(class_columns):
-            fieldnames.append(f"class_{value}")
+        class_field_order: List[str] = []
+        if class_columns:
+            for value in sorted(class_columns.keys()):
+                class_field_order.append(class_columns[value])
+        else:
+            dynamic_columns: List[str] = []
+            for row in rows:
+                for key in row.keys():
+                    if key.endswith("_px_sum") or key.startswith("class_"):
+                        dynamic_columns.append(key)
+            class_field_order.extend(sorted(set(dynamic_columns)))
+        fieldnames.extend(class_field_order)
         manifest_path = dest_path / "dataset.csv"
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         with manifest_path.open("w", newline="", encoding="utf-8") as handle:
@@ -1496,7 +1947,7 @@ class MainWindow(QMainWindow):
             for row in rows:
                 normalized_row: Dict[str, object] = {}
                 for field in fieldnames:
-                    if field.startswith("class_"):
+                    if field in class_field_order:
                         normalized_row[field] = row.get(field, 0)
                     else:
                         normalized_row[field] = row.get(field, "")
@@ -1546,12 +1997,13 @@ class MainWindow(QMainWindow):
         entries: Sequence[DatasetEntry],
         *,
         class_mapping: Optional[Dict[int, int]] = None,
-        class_value_columns: Sequence[int] = (),
+        class_columns: Mapping[int, str],
+        include_images: bool,
         progress: Optional[QProgressDialog] = None,
         progress_total: int = 0,
         start_time: Optional[float] = None,
     ) -> Tuple[str, List[Dict[str, object]]]:
-        images_dir, labels_dir = self._prepare_export_dirs(dest_path)
+        images_dir, labels_dir = self._prepare_export_dirs(dest_path, include_images=include_images)
         exported_images = 0
         exported_labels = 0
         skipped_images: List[str] = []
@@ -1564,7 +2016,8 @@ class MainWindow(QMainWindow):
             label_saved = False
             image_output: Optional[Path] = None
             label_output: Optional[Path] = None
-            if entry.image is not None:
+            label_to_save: Optional[np.ndarray] = None
+            if include_images and entry.image is not None:
                 image_name = entry.image_path.name if entry.image_path else f"{entry.name}.png"
                 image_output = images_dir / image_name
                 try:
@@ -1578,7 +2031,7 @@ class MainWindow(QMainWindow):
                         "Export warning",
                         f"Failed to export image for {entry.name}: {exc}",
                     )
-            else:
+            elif include_images:
                 skipped_images.append(entry.name)
 
             if entry.edited_label is not None:
@@ -1604,16 +2057,16 @@ class MainWindow(QMainWindow):
             else:
                 skipped_labels.append(entry.name)
 
-            if image_saved and label_saved and image_output is not None and label_output is not None:
-                class_counts = self._count_class_pixels(label_to_save)
+            if label_saved and label_output is not None:
+                class_counts = self._count_class_pixels(label_to_save) if label_to_save is not None else {}
                 manifest_rows.append(
                     self._build_manifest_row(
                         dest_path,
-                        image_output,
+                        image_output if image_saved else None,
                         label_output,
                         entry,
                         class_counts=class_counts,
-                        class_value_columns=class_value_columns,
+                        class_columns=class_columns,
                     )
                 )
 
@@ -1628,6 +2081,8 @@ class MainWindow(QMainWindow):
             message += f"; skipped {len(skipped_images)} image(s)"
         if skipped_labels:
             message += f"; skipped {len(skipped_labels)} label(s)"
+        if not include_images:
+            message += " (labels-only export)"
         return message, manifest_rows
 
     def _export_subimage_entries(
@@ -1638,15 +2093,17 @@ class MainWindow(QMainWindow):
         tile_height: int,
         *,
         class_mapping: Optional[Dict[int, int]] = None,
-        class_value_columns: Sequence[int] = (),
+        class_columns: Mapping[int, str],
+        include_images: bool,
         progress: Optional[QProgressDialog] = None,
         progress_total: int = 0,
         start_time: Optional[float] = None,
     ) -> Tuple[str, List[Dict[str, object]]]:
         if tile_width <= 0 or tile_height <= 0:
             raise RuntimeError("Tile dimensions must be positive.")
-        images_dir, labels_dir = self._prepare_export_dirs(dest_path)
-        total_pairs = 0
+        images_dir, labels_dir = self._prepare_export_dirs(dest_path, include_images=include_images)
+        exported_images = 0
+        exported_labels = 0
         skipped_items: List[str] = []
         manifest_rows: List[Dict[str, object]] = []
         processed = 0
@@ -1672,11 +2129,18 @@ class MainWindow(QMainWindow):
                     tile_label = label[top : top + tile_height, left : left + tile_width]
                     tile_label = self._apply_class_mapping(tile_label, class_mapping)
                     tile_name = f"{entry.name}_sub_img_{tile_index:03d}"
-                    image_output = images_dir / f"{tile_name}.png"
-                    label_output = labels_dir / self._normalize_label_filename(f"{tile_name}.png")
+                    image_output: Optional[Path] = None
+                    image_saved = False
+                    if include_images:
+                        image_output = images_dir / f"{tile_name}.png"
                     try:
-                        save_rgb_image(tile_image, image_output)
+                        if include_images and image_output is not None:
+                            save_rgb_image(tile_image, image_output)
+                            exported_images += 1
+                            image_saved = True
+                        label_output = labels_dir / self._normalize_label_filename(f"{tile_name}.png")
                         save_label_image(tile_label, label_output)
+                        exported_labels += 1
                     except Exception as exc:  # noqa: BLE001
                         QMessageBox.warning(
                             self,
@@ -1685,35 +2149,36 @@ class MainWindow(QMainWindow):
                         )
                     else:
                         tiles_created += 1
-                        total_pairs += 1
                         class_counts = self._count_class_pixels(tile_label)
                         manifest_rows.append(
                             self._build_manifest_row(
                                 dest_path,
-                                image_output,
+                                image_output if image_saved else None,
                                 label_output,
                                 entry,
                                 subimg_id=tile_index,
                                 x=left,
                                 y=top,
                                 class_counts=class_counts,
-                                class_value_columns=class_value_columns,
+                                class_columns=class_columns,
                             )
                         )
                     finally:
                         tile_index += 1
                         processed += 1
                         self._update_progress_dialog(
-                            progress, processed, progress_total, total_pairs, total_pairs, start
+                            progress, processed, progress_total, exported_images, exported_labels, start
                         )
             if tiles_created == 0:
                 skipped_items.append(entry.name)
         message = (
-            f"Exported {total_pairs} sub-image pair(s) of size {tile_width}x{tile_height} "
-            f"from {len(entries)} item(s) to {dest_path}"
+            f"Exported {exported_images} image(s) and {exported_labels} label(s) "
+            f"as {tile_width}x{tile_height} tiles from {len(entries)} item(s) to {dest_path}"
         )
         if skipped_items:
             message += f"; skipped {len(skipped_items)} item(s) (missing data or size mismatch)"
+        if not include_images:
+            message += " (labels-only export)"
         return message, manifest_rows
 
     # ----- Rendering --------------------------------------------------------
@@ -1729,14 +2194,24 @@ class MainWindow(QMainWindow):
             return
         self.canvas.set_base_image(base_image)
         self.canvas.set_label_array(entry.edited_label)
+        self.canvas.set_measurements(self._measurements_for_entry(entry))
         classes = self.class_manager.get_classes()
         overlay_labels = entry.original_label if self._show_original_label else entry.edited_label
-        pixmap = self._render_overlay(
-            base_image,
-            overlay_labels,
-            classes,
-            self.alpha_slider.value() / 100.0,
-        )
+        pixmap: Optional[QPixmap] = None
+        if self.skeleton_checkbox.isChecked():
+            pixmap = self._render_skeleton_overlay(
+                base_image,
+                overlay_labels,
+                self.skeleton_class_combo.currentData(),
+                self.alpha_slider.value() / 100.0,
+            )
+        if pixmap is None:
+            pixmap = self._render_overlay(
+                base_image,
+                overlay_labels,
+                classes,
+                self.alpha_slider.value() / 100.0,
+            )
         self.canvas.set_pixmap(pixmap)
         self.canvas.viewport().update()
 
@@ -1844,6 +2319,7 @@ class ExportOptionsDialog(QDialog):
         self._initial_dir = str(initial_dir) if initial_dir else ""
         self._classes: List[ClassDefinition] = list(classes or [])
         self._final_class_mapping: Dict[int, int] = {}
+        self._final_class_labels: Dict[int, str] = {}
 
         layout = QVBoxLayout(self)
 
@@ -1858,6 +2334,15 @@ class ExportOptionsDialog(QDialog):
         mode_layout.addWidget(self.full_radio)
         mode_layout.addWidget(self.tiles_radio)
         layout.addWidget(mode_group_box)
+
+        content_group_box = QGroupBox("Export Content")
+        content_layout = QVBoxLayout(content_group_box)
+        self.images_and_labels_radio = QRadioButton("Images and labels")
+        self.labels_only_radio = QRadioButton("Labels only")
+        self.images_and_labels_radio.setChecked(True)
+        content_layout.addWidget(self.images_and_labels_radio)
+        content_layout.addWidget(self.labels_only_radio)
+        layout.addWidget(content_group_box)
 
         dimension_box = QGroupBox("Sub-image dimensions (pixels)")
         dimension_layout = QFormLayout(dimension_box)
@@ -1919,12 +2404,16 @@ class ExportOptionsDialog(QDialog):
         mode = ExportMode.SUB_IMAGES if self.tiles_radio.isChecked() else ExportMode.FULL
         destination = Path(self.destination_edit.text().strip())
         class_mapping = self._compute_final_class_mapping() if self._classes else {}
+        include_images = self.images_and_labels_radio.isChecked()
+        class_labels = dict(self._final_class_labels) if self._classes else {}
         return ExportOptions(
             destination=destination,
             mode=mode,
             tile_width=self.width_spin.value(),
             tile_height=self.height_spin.value(),
             class_mapping=class_mapping,
+            include_images=include_images,
+            class_labels=class_labels,
         )
 
     # ----- Class remapping panel -------------------------------------------
@@ -1974,6 +2463,7 @@ class ExportOptionsDialog(QDialog):
 
     def _compute_final_class_mapping(self) -> Dict[int, int]:
         if not self._classes:
+            self._final_class_labels = {}
             return {}
         selection: List[Tuple[int, int]] = []
         for row, cls in enumerate(self._classes):
@@ -1992,6 +2482,11 @@ class ExportOptionsDialog(QDialog):
         mapping: Dict[int, int] = {}
         for source_value, target_value in selection:
             mapping[source_value] = target_to_new.get(target_value, source_value)
+        value_to_name = {cls.value: cls.name for cls in self._classes}
+        self._final_class_labels = {
+            final_value: value_to_name.get(target_value, str(target_value))
+            for target_value, final_value in target_to_new.items()
+        }
         self._final_class_mapping = mapping
         return mapping
 

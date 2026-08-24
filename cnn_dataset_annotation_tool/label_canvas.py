@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QWidget
 
 from .models import EditOperation
@@ -17,15 +17,30 @@ class ToolMode(Enum):
     MAGNETIC_LASSO = "magnetic_lasso"
     POLYGON = "polygon"
     POLYLINE = "polyline"
+    MEASURE = "measure"
 
 
 class LabelCanvas(QGraphicsView):
     """Interactive canvas visualizing the image/label overlay."""
 
+    MAX_ZOOM = 64.0          # hard ceiling: one image pixel spans 64 screen pixels
+    MIN_FIT_FRACTION = 0.5   # floor: half of the whole-image fit-to-viewport scale
+
+    # one color per annotator, assigned by sorted name order ("" first keeps the default green)
+    MEASURE_COLORS = [
+        (0, 230, 130),
+        (80, 180, 255),
+        (255, 170, 40),
+        (255, 90, 220),
+        (255, 235, 60),
+        (170, 120, 255),
+    ]
+
     labelEdited = Signal()
     operationPerformed = Signal(object)
     polylineWidthChanged = Signal(int)
     brushRadiusChanged = Signal(int)
+    measurementsChanged = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -66,6 +81,10 @@ class LabelCanvas(QGraphicsView):
         self._brush_preview_image: Optional[QImage] = None
         self._brush_preview_dirty = False
         self._brush_preview_color = QColor(255, 255, 255, 160)
+        self._measurements: List[Dict[str, float]] = []
+        self._measure_start: Optional[QPointF] = None
+        self._show_measure_labels = True
+        self._current_annotator = ""
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
         self._pixmap_item.setPixmap(pixmap)
@@ -83,6 +102,27 @@ class LabelCanvas(QGraphicsView):
         self._base_image = None
         self._gradient_map = None
         self._cancel_lasso()
+        self._measurements = []
+        self._measure_start = None
+        self.viewport().update()
+
+    def set_measurements(self, measurements: Optional[List[Dict[str, float]]]) -> None:
+        """Replace the width measurements shown for the current item (no signal emitted)."""
+        self._measurements = [dict(m) for m in (measurements or [])]
+        self._measure_start = None
+        self.viewport().update()
+
+    def measurements(self) -> List[Dict[str, float]]:
+        return [dict(m) for m in self._measurements]
+
+    def set_measure_labels_visible(self, visible: bool) -> None:
+        if visible == self._show_measure_labels:
+            return
+        self._show_measure_labels = visible
+        self.viewport().update()
+
+    def set_annotator(self, name: str) -> None:
+        self._current_annotator = str(name).strip()
         self.viewport().update()
 
     def set_label_array(self, array: Optional[np.ndarray]) -> None:
@@ -131,6 +171,7 @@ class LabelCanvas(QGraphicsView):
             return
         self._tool_mode = mode
         self._cancel_lasso()
+        self._measure_start = None
         self._hover_pos = None
         self._clear_brush_preview()
         if self._tool_mode == ToolMode.POLYLINE:
@@ -317,9 +358,30 @@ class LabelCanvas(QGraphicsView):
             return
         if event.modifiers() & Qt.ControlModifier:
             factor = 1.25 if event.angleDelta().y() > 0 else 0.8
-            self.scale(factor, factor)
+            self._apply_zoom(factor)
             return
         super().wheelEvent(event)
+
+    def _fit_scale(self) -> float:
+        """Scale at which the whole image fits the viewport."""
+        width, height = self._image_size
+        viewport = self.viewport()
+        if width <= 0 or height <= 0 or viewport.width() <= 0 or viewport.height() <= 0:
+            return 1.0
+        return min(viewport.width() / width, viewport.height() / height)
+
+    def _apply_zoom(self, factor: float) -> None:
+        current = float(self.transform().m11())
+        if current <= 0.0 or self._image_size == (0, 0):
+            return
+        # Never allow zooming out past half the fit-to-view scale (capped at 1:1 so
+        # small images always reach 100%), nor zooming in past MAX_ZOOM.
+        minimum = min(self._fit_scale() * self.MIN_FIT_FRACTION, 1.0)
+        target = max(minimum, min(current * factor, self.MAX_ZOOM))
+        effective = target / current
+        if abs(effective - 1.0) < 1e-6:
+            return
+        self.scale(effective, effective)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if self._tool_mode == ToolMode.BRUSH:
@@ -360,6 +422,9 @@ class LabelCanvas(QGraphicsView):
                 return
         elif self._tool_mode == ToolMode.POLYLINE:
             if self._handle_polyline_press(event):
+                return
+        elif self._tool_mode == ToolMode.MEASURE:
+            if self._handle_measure_press(event):
                 return
         else:
             scene_pos = self.mapToScene(event.position().toPoint())
@@ -537,6 +602,71 @@ class LabelCanvas(QGraphicsView):
             return True
         return False
 
+    def _handle_measure_press(self, event) -> bool:
+        if event.button() == Qt.MiddleButton:
+            return False
+        scene_pos = self.mapToScene(event.position().toPoint())
+        if event.button() == Qt.LeftButton:
+            if not self._within_image(scene_pos):
+                event.accept()
+                return True
+            if self._measure_start is None:
+                self._measure_start = QPointF(scene_pos)
+            else:
+                start = self._measure_start
+                length = math.hypot(scene_pos.x() - start.x(), scene_pos.y() - start.y())
+                if length >= 0.5:
+                    item: Dict[str, object] = {
+                        "x1": float(start.x()),
+                        "y1": float(start.y()),
+                        "x2": float(scene_pos.x()),
+                        "y2": float(scene_pos.y()),
+                    }
+                    if self._current_annotator:
+                        item["annotator"] = self._current_annotator
+                    self._measurements.append(item)
+                    self.measurementsChanged.emit()
+                self._measure_start = None
+            self.viewport().update()
+            event.accept()
+            return True
+        if event.button() == Qt.RightButton:
+            if self._measure_start is not None:
+                self._measure_start = None
+            else:
+                index = self._measurement_at(scene_pos)
+                if index is not None:
+                    del self._measurements[index]
+                    self.measurementsChanged.emit()
+            self.viewport().update()
+            event.accept()
+            return True
+        return False
+
+    def _measurement_at(self, point: QPointF) -> Optional[int]:
+        radius = max(6.0 * self._scene_unit(), 2.0)
+        best_index: Optional[int] = None
+        best_distance = radius
+        for index, item in enumerate(self._measurements):
+            distance = self._point_segment_distance(
+                point.x(), point.y(), item["x1"], item["y1"], item["x2"], item["y2"]
+            )
+            if distance <= best_distance:
+                best_distance = distance
+                best_index = index
+        return best_index
+
+    @staticmethod
+    def _point_segment_distance(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 0.0:
+            return math.hypot(px - x1, py - y1)
+        t = ((px - x1) * dx + (py - y1) * dy) / length_sq
+        t = max(0.0, min(1.0, t))
+        return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         scene_pos = self.mapToScene(event.position().toPoint())
         self._hover_pos = scene_pos if self._within_image(scene_pos) else None
@@ -671,6 +801,93 @@ class LabelCanvas(QGraphicsView):
             painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(self._hover_pos, radius, radius)
             painter.restore()
+        if self._tool_mode == ToolMode.MEASURE:
+            self._draw_measurements(painter, unit)
+
+    def _annotator_colors(self) -> Dict[str, Tuple[int, int, int]]:
+        names = {str(item.get("annotator", "")) for item in self._measurements}
+        names.add(self._current_annotator)
+        return {
+            name: self.MEASURE_COLORS[index % len(self.MEASURE_COLORS)]
+            for index, name in enumerate(sorted(names))
+        }
+
+    def _draw_measurements(self, painter: QPainter, unit: float) -> None:
+        painter.save()
+        colors = self._annotator_colors()
+        pen_width = max(1.2 * unit, unit)
+        tick_half = max(3.0 * unit, 1.5)
+        for item in self._measurements:
+            rgb = colors[str(item.get("annotator", ""))]
+            painter.setPen(QPen(QColor(*rgb, 235), pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            start = QPointF(item["x1"], item["y1"])
+            end = QPointF(item["x2"], item["y2"])
+            painter.drawLine(start, end)
+            self._draw_measure_ticks(painter, start, end, tick_half)
+            if self._show_measure_labels:
+                length = math.hypot(end.x() - start.x(), end.y() - start.y())
+                mid = QPointF((start.x() + end.x()) * 0.5, (start.y() + end.y()) * 0.5)
+                self._draw_measure_label(painter, mid, f"{length:.1f} px", unit, rgb)
+        if self._measure_start is not None:
+            active_rgb = colors[self._current_annotator]
+            marker_pen = QPen(QColor(*active_rgb, 235), pen_width)
+            painter.setPen(marker_pen)
+            cross = max(4.0 * unit, 2.0)
+            painter.drawLine(
+                QPointF(self._measure_start.x() - cross, self._measure_start.y()),
+                QPointF(self._measure_start.x() + cross, self._measure_start.y()),
+            )
+            painter.drawLine(
+                QPointF(self._measure_start.x(), self._measure_start.y() - cross),
+                QPointF(self._measure_start.x(), self._measure_start.y() + cross),
+            )
+            if self._hover_pos is not None:
+                preview_pen = QPen(QColor(*active_rgb, 170), pen_width, Qt.DashLine)
+                painter.setPen(preview_pen)
+                painter.drawLine(self._measure_start, self._hover_pos)
+                length = math.hypot(
+                    self._hover_pos.x() - self._measure_start.x(),
+                    self._hover_pos.y() - self._measure_start.y(),
+                )
+                self._draw_measure_label(painter, self._hover_pos, f"{length:.1f} px", unit, active_rgb)
+        painter.restore()
+
+    @staticmethod
+    def _draw_measure_ticks(painter: QPainter, start: QPointF, end: QPointF, half_length: float) -> None:
+        dx = end.x() - start.x()
+        dy = end.y() - start.y()
+        norm = math.hypot(dx, dy)
+        if norm <= 0.0:
+            return
+        # Perpendicular unit vector marks the two crack edges the user clicked.
+        ux = -dy / norm
+        uy = dx / norm
+        for point in (start, end):
+            painter.drawLine(
+                QPointF(point.x() - ux * half_length, point.y() - uy * half_length),
+                QPointF(point.x() + ux * half_length, point.y() + uy * half_length),
+            )
+
+    def _draw_measure_label(
+        self,
+        painter: QPainter,
+        anchor: QPointF,
+        text: str,
+        unit: float,
+        rgb: Tuple[int, int, int] = (0, 255, 150),
+    ) -> None:
+        font = QFont(painter.font())
+        font.setPixelSize(max(int(round(11.0 * unit)), 2))
+        font.setBold(True)
+        painter.setFont(font)
+        offset = 5.0 * unit
+        position = QPointF(anchor.x() + offset, anchor.y() - offset)
+        halo = max(1.0 * unit, 0.5)
+        painter.setPen(QPen(QColor(20, 20, 20, 220)))
+        for dx, dy in ((-halo, 0.0), (halo, 0.0), (0.0, -halo), (0.0, halo)):
+            painter.drawText(QPointF(position.x() + dx, position.y() + dy), text)
+        painter.setPen(QPen(QColor(*rgb, 255)))
+        painter.drawText(position, text)
 
     def _within_image(self, point: QPointF) -> bool:
         width, height = self._image_size

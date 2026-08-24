@@ -37,13 +37,16 @@ A smoke-test pair lives in `datasets/images` and `datasets/labels`.
 - Track every modification with undo/redo shortcuts, inspect the history tab, and revert an item back to its original mask.
 - Mark items for export from the list context menu, then export selected images and labels into organised `Images/` and `Labels/` directories.
 - Save all work—including images, masks, class definitions, and per-entry metadata—to parquet for later resumption or CLI automation.
+- Visualize any class as a **distance map + skeleton** (Tools tab → "Distance Map / Skeleton View"): pick a class (defaults to Crack), and the overlay colors each class pixel by its Euclidean distance to the class edge (dark blue = edge, yellow = center) with the medial skeleton drawn in red — the same construction as the CNN crack-width metric (width = 2 × distance at the skeleton). Use it to pick representative crack locations before measuring widths. Requires `scipy` + `scikit-image`; the result is cached and recomputed only when the mask changes.
+- Measure crack widths manually with the **Measure Width** tool: left click the two opposite crack edges to record a width (shown in px on the canvas), right click to cancel the first point or delete the nearest measurement. A "Show measured values" checkbox in the controls hides the numeric labels when many measurements would clutter the view (lines and end ticks stay visible). An **Annotator** field tags every new measurement with the person's name — measurements are drawn in a distinct color per annotator, the name is stored in the metadata and exported in the CSV (`annotator` column), enabling per-person analysis (e.g., inter-annotator agreement).
+- Merge measurements from another session or person with **File → Import Width Measurements (CSV)...**: rows are matched to entries by `entry` name (or `image_file`), exact duplicates are skipped, and rows without an annotator get the current Annotator field value (or `imported`). The import summary reports imported/duplicate/unmatched counts. Measurements are stored in the per-entry metadata (key `width_measurements`), survive session save/load, and export to CSV via `File → Export Width Measurements (CSV)...` — including the label class value under each measurement midpoint for QA. Used to validate the CNN-derived crack-width metric against independent manual readings.
 
 ### Typical Workflow
 1. Click `Load Dataset` and choose between a parquet session or paired folders.
 2. Use `Add Image` / `Load Mask` to fill in missing pairs if needed.
 3. Auto-detect classes or configure them manually, then review overlay alpha and source/target selections.
 4. Pick an editing tool; left click applies the configured direction, right click reverses it.
-5. Zoom with `Ctrl` + mouse wheel, pan with the middle mouse button, and use undo/redo as you refine the mask.
+5. Zoom with `Ctrl` + mouse wheel (clamped between half the fit-to-view scale and 64× so the image can never be zoomed out of reach), pan with the middle mouse button, and use undo/redo as you refine the mask.
 6. Toggle between edited and original labels or reset the current item when you need a clean slate.
 7. Mark finished items for export via the list context menu.
 8. Save the session to parquet or run `Export Images & Labels` to write the marked items to disk.

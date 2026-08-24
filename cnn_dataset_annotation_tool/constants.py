@@ -8,6 +8,10 @@ from PySide6.QtGui import QColor
 DATA_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 LABEL_EXTENSIONS = {".png", ".tif", ".tiff"}
 
+# Metadata key holding manual crack-width measurements as a JSON list of
+# {"x1", "y1", "x2", "y2"} pixel coordinates (stored per entry, persisted to parquet).
+WIDTH_MEASUREMENTS_KEY = "width_measurements"
+
 DEFAULT_COLORS = [
     "#1f77b4",
     "#ff7f0e",
